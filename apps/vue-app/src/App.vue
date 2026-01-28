@@ -905,6 +905,7 @@ body {
 .legend-icon {
   font-size: 1.2em;
   line-height: 1;
+  min-width: 20px;
   font-weight: bold;
   display: flex;
   align-items: center;
