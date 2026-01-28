@@ -29,6 +29,7 @@
     "@nestjs/websockets": "^11.1.12",
     "buffer-crc32": "^1.0.0",
     "crc": "^4.3.2",
+    "decimal.js": "^10.6.0",
     "json-bigint": "^1.0.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",

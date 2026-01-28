@@ -220,13 +220,19 @@ export class MarketDataGateway
           timestamp: new Date().toISOString(),
           lastOrderbookUpdate: marketData.orderbook.lastUpdate, // When orderbook was last updated
           asks: marketData.orderbook.asks
-            .sort((a, b) => a.price - b.price) // Sort asks by price ascending (lowest first)
+            .sort((a, b) => a.price.comparedTo(b.price)) // Sort asks by price ascending (lowest first)
             .slice(0, 3) // Show top 3 ask levels
-            .map((ask) => ({ price: ask.price, volume: ask.quantity })),
+            .map((ask) => ({
+              price: ask.price.toString(),
+              volume: ask.quantity.toString(),
+            })),
           bids: marketData.orderbook.bids
-            .sort((a, b) => b.price - a.price) // Sort bids by price descending (highest first)
+            .sort((a, b) => b.price.comparedTo(a.price)) // Sort bids by price descending (highest first)
             .slice(0, 3) // Show top 3 bid levels
-            .map((bid) => ({ price: bid.price, volume: bid.quantity })),
+            .map((bid) => ({
+              price: bid.price.toString(),
+              volume: bid.quantity.toString(),
+            })),
           spread: marketData.orderbook.spread,
           midPrice: marketData.orderbook.midPrice,
           orderbookSpeed: marketData.orderbooksPerMinute,

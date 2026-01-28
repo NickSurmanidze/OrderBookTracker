@@ -48,11 +48,13 @@ export interface KrakenSubscriptionStatus {
   req_id?: number;
 }
 
+import { Decimal } from 'decimal.js';
+
 export interface OrderBookEntry {
-  price: number;
-  quantity: number;
-  originalPrice?: string; // Original string from JSON to preserve precision for checksums
-  originalQty?: string; // Original string from JSON to preserve precision for checksums
+  price: Decimal; // Use Decimal for precise arithmetic
+  quantity: Decimal; // Use Decimal for precise arithmetic
+  originalPrice: string; // Original string from JSON to preserve exact representation for checksums
+  originalQty: string; // Original string from JSON to preserve exact representation for checksums
 }
 
 export interface OrderBook {

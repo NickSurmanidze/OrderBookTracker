@@ -582,7 +582,7 @@ const getSpeedStatus = (
         </div>
 
         <div class="legend-section">
-          <h4>Data Freshness</h4>
+          <h4>Last update received</h4>
           <div class="legend-items">
             <div class="legend-item">
               <span class="legend-icon freshness-fresh">⬤</span>

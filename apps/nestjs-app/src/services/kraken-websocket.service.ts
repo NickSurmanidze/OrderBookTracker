@@ -8,6 +8,7 @@ import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 import crc32 from 'buffer-crc32';
 import JSONbig from 'json-bigint';
+import { Decimal } from 'decimal.js';
 import { MetricsService } from './metrics.service';
 import {
   KrakenMessage,
@@ -836,10 +837,13 @@ export class KrakenWebSocketService
     //   Formula: (Best Bid + Best Ask) / 2
     // - Spread: The difference between top ask and top bid as a percentage
     //   Formula: (Top Ask Price - Top Bid Price) / Mid Price * 100
-    const bestBid = Math.max(...bids.map((b) => b.price));
-    const bestAsk = Math.min(...asks.map((a) => a.price));
-    const midPrice = (bestBid + bestAsk) / 2;
-    const spreadPercentage = ((bestAsk - bestBid) / midPrice) * 100;
+    const bestBid = Decimal.max(...bids.map((b) => b.price));
+    const bestAsk = Decimal.min(...asks.map((a) => a.price));
+    const midPrice = bestBid.plus(bestAsk).dividedBy(2);
+    const spreadPercentage = bestAsk
+      .minus(bestBid)
+      .dividedBy(midPrice)
+      .times(100);
 
     // Update in-memory store
     this.inMemoryStore[symbol.toUpperCase()] = {
@@ -847,8 +851,8 @@ export class KrakenWebSocketService
       orderbook: {
         spread: spreadPercentage.toString(),
         midPrice: midPrice.toString(),
-        asks: asks.sort((a, b) => a.price - b.price),
-        bids: bids.sort((a, b) => b.price - a.price),
+        asks: asks.sort((a, b) => a.price.comparedTo(b.price)),
+        bids: bids.sort((a, b) => b.price.comparedTo(a.price)),
         lastUpdate: new Date().toISOString(),
         lastProcessedTimestamp: data.timestamp, // Initialize with snapshot timestamp
       },
@@ -936,8 +940,8 @@ export class KrakenWebSocketService
 
     // After applying ALL updates in the message, truncate to subscribed depth (10 levels)
     // This is critical - Kraken expects checksums on exactly the subscribed depth
-    marketData.orderbook.bids.sort((a, b) => b.price - a.price);
-    marketData.orderbook.asks.sort((a, b) => a.price - b.price);
+    marketData.orderbook.bids.sort((a, b) => b.price.comparedTo(a.price));
+    marketData.orderbook.asks.sort((a, b) => a.price.comparedTo(b.price));
 
     // Truncate to exactly 10 levels (our subscribed depth) - this is what Kraken uses for checksum
     marketData.orderbook.bids = marketData.orderbook.bids.slice(0, 10);
@@ -954,14 +958,14 @@ export class KrakenWebSocketService
       // Deep clone the orderbook state immediately to avoid race conditions
       orderbookSnapshot = {
         asks: marketData.orderbook.asks.map((ask) => ({
-          price: ask.price,
-          quantity: ask.quantity,
+          price: new Decimal(ask.price),
+          quantity: new Decimal(ask.quantity),
           originalPrice: ask.originalPrice,
           originalQty: ask.originalQty,
         })),
         bids: marketData.orderbook.bids.map((bid) => ({
-          price: bid.price,
-          quantity: bid.quantity,
+          price: new Decimal(bid.price),
+          quantity: new Decimal(bid.quantity),
           originalPrice: bid.originalPrice,
           originalQty: bid.originalQty,
         })),
@@ -977,14 +981,17 @@ export class KrakenWebSocketService
       marketData.orderbook.bids.length > 0 &&
       marketData.orderbook.asks.length > 0
     ) {
-      const bestBid = Math.max(
+      const bestBid = Decimal.max(
         ...marketData.orderbook.bids.map((b) => b.price),
       );
-      const bestAsk = Math.min(
+      const bestAsk = Decimal.min(
         ...marketData.orderbook.asks.map((a) => a.price),
       );
-      const midPrice = (bestBid + bestAsk) / 2;
-      const spreadPercentage = ((bestAsk - bestBid) / midPrice) * 100;
+      const midPrice = bestBid.plus(bestAsk).dividedBy(2);
+      const spreadPercentage = bestAsk
+        .minus(bestBid)
+        .dividedBy(midPrice)
+        .times(100);
 
       // Don't validate here - will be validated after all queued updates are processed
       marketData.orderbook.spread = spreadPercentage.toString();
@@ -1237,10 +1244,14 @@ export class KrakenWebSocketService
     const { asks, bids } = marketData.orderbook;
 
     // Get top 10 asks sorted ascending (lowest to highest)
-    const top10Asks = [...asks].sort((a, b) => a.price - b.price).slice(0, 10);
+    const top10Asks = [...asks]
+      .sort((a, b) => a.price.comparedTo(b.price))
+      .slice(0, 10);
 
     // Get top 10 bids sorted descending (highest to lowest)
-    const top10Bids = [...bids].sort((a, b) => b.price - a.price).slice(0, 10);
+    const top10Bids = [...bids]
+      .sort((a, b) => b.price.comparedTo(a.price))
+      .slice(0, 10);
 
     // Check if we have originalPrice/originalQty preserved
     const asksWithOriginal = top10Asks.filter((a) => a.originalPrice).length;
@@ -1271,7 +1282,7 @@ export class KrakenWebSocketService
       askStrings.push(formatted);
       checksumString += formatted;
       askDetails.push(
-        `${ask.price}/${ask.quantity} (orig: ${ask.originalPrice || 'none'}/${ask.originalQty || 'none'})`,
+        `${ask.price.toString()}/${ask.quantity.toString()} (orig: ${ask.originalPrice || 'none'}/${ask.originalQty || 'none'})`,
       );
     }
     const bidStrings: string[] = [];
@@ -1281,7 +1292,7 @@ export class KrakenWebSocketService
       bidStrings.push(formatted);
       checksumString += formatted;
       bidDetails.push(
-        `${bid.price}/${bid.quantity} (orig: ${bid.originalPrice || 'none'}/${bid.originalQty || 'none'})`,
+        `${bid.price.toString()}/${bid.quantity.toString()} (orig: ${bid.originalPrice || 'none'}/${bid.originalQty || 'none'})`,
       );
     }
 
@@ -1380,21 +1391,21 @@ export class KrakenWebSocketService
 
       // Get top 10 asks sorted ascending (lowest to highest)
       const top10Asks = [...orderbookSnapshot.asks]
-        .sort((a, b) => a.price - b.price)
+        .sort((a, b) => a.price.comparedTo(b.price))
         .slice(0, 10);
 
       // Get top 10 bids sorted descending (highest to lowest)
       const top10Bids = [...orderbookSnapshot.bids]
-        .sort((a, b) => b.price - a.price)
+        .sort((a, b) => b.price.comparedTo(a.price))
         .slice(0, 10);
 
       const askDetails = top10Asks.map(
         (a) =>
-          `${a.price}/${a.quantity} (orig: ${a.originalPrice || 'NONE'}/${a.originalQty || 'NONE'})`,
+          `${a.price.toString()}/${a.quantity.toString()} (orig: ${a.originalPrice || 'NONE'}/${a.originalQty || 'NONE'})`,
       );
       const bidDetails = top10Bids.map(
         (b) =>
-          `${b.price}/${b.quantity} (orig: ${b.originalPrice || 'NONE'}/${b.originalQty || 'NONE'})`,
+          `${b.price.toString()}/${b.quantity.toString()} (orig: ${b.originalPrice || 'NONE'}/${b.originalQty || 'NONE'})`,
       );
 
       this.logger.warn(
@@ -1471,7 +1482,7 @@ export class KrakenWebSocketService
         checksumString += formatted;
         if (debugLog && debugParts) {
           debugParts.push(
-            `ASK ${ask.price}/${ask.quantity} [NO ORIG] → ${formatted}`,
+            `ASK ${ask.price.toString()}/${ask.quantity.toString()} [NO ORIG] → ${formatted}`,
           );
         }
       }
@@ -1494,7 +1505,7 @@ export class KrakenWebSocketService
         checksumString += formatted;
         if (debugLog && debugParts) {
           debugParts.push(
-            `BID ${bid.price}/${bid.quantity} [NO ORIG] → ${formatted}`,
+            `BID ${bid.price.toString()}/${bid.quantity.toString()} [NO ORIG] → ${formatted}`,
           );
         }
       }
@@ -1531,19 +1542,19 @@ export class KrakenWebSocketService
 
       // Log detailed information about the mismatch
       const top10Asks = [...(marketData?.orderbook.asks || [])]
-        .sort((a, b) => a.price - b.price)
+        .sort((a, b) => a.price.comparedTo(b.price))
         .slice(0, 10);
       const top10Bids = [...(marketData?.orderbook.bids || [])]
-        .sort((a, b) => b.price - a.price)
+        .sort((a, b) => b.price.comparedTo(a.price))
         .slice(0, 10);
 
       const askDetails = top10Asks.map(
         (a) =>
-          `${a.price}/${a.quantity} (orig: ${a.originalPrice || 'NONE'}/${a.originalQty || 'NONE'})`,
+          `${a.price.toString()}/${a.quantity.toString()} (orig: ${a.originalPrice || 'NONE'}/${a.originalQty || 'NONE'})`,
       );
       const bidDetails = top10Bids.map(
         (b) =>
-          `${b.price}/${b.quantity} (orig: ${b.originalPrice || 'NONE'}/${b.originalQty || 'NONE'})`,
+          `${b.price.toString()}/${b.quantity.toString()} (orig: ${b.originalPrice || 'NONE'}/${b.originalQty || 'NONE'})`,
       );
 
       this.logger.warn(
@@ -1580,8 +1591,8 @@ export class KrakenWebSocketService
           `  Bid formatted: [${checksumBidStrings.join(', ')}]\n` +
           `  Full checksum string: "${fullChecksumString}"\n` +
           `  String length: ${fullChecksumString.length}\n` +
-          `  Note: Asks sorted ascending (${top10Asks[0]?.price} to ${top10Asks[9]?.price}), ` +
-          `Bids sorted descending (${top10Bids[0]?.price} to ${top10Bids[9]?.price})`,
+          `  Note: Asks sorted ascending (${top10Asks[0]?.price.toString()} to ${top10Asks[9]?.price.toString()}), ` +
+          `Bids sorted descending (${top10Bids[0]?.price.toString()} to ${top10Bids[9]?.price.toString()})`,
       );
 
       this.resyncMarket(normalizedSymbol);
@@ -1599,29 +1610,29 @@ export class KrakenWebSocketService
       marketData.orderbook.bids.length > 0 &&
       marketData.orderbook.asks.length > 0
     ) {
-      const bestBid = Math.max(
+      const bestBid = Decimal.max(
         ...marketData.orderbook.bids.map((b) => b.price),
       );
-      const bestAsk = Math.min(
+      const bestAsk = Decimal.min(
         ...marketData.orderbook.asks.map((a) => a.price),
       );
 
       // Check if orderbook is invalid after processing ALL updates
-      if (bestBid >= bestAsk) {
+      if (bestBid.greaterThanOrEqualTo(bestAsk)) {
         // Log detailed orderbook state for debugging
         const topBids = marketData.orderbook.bids
-          .sort((a, b) => b.price - a.price)
+          .sort((a, b) => b.price.comparedTo(a.price))
           .slice(0, 5)
-          .map((b) => `${b.price}@${b.quantity}`)
+          .map((b) => `${b.price.toString()}@${b.quantity.toString()}`)
           .join(', ');
         const topAsks = marketData.orderbook.asks
-          .sort((a, b) => a.price - b.price)
+          .sort((a, b) => a.price.comparedTo(b.price))
           .slice(0, 5)
-          .map((a) => `${a.price}@${a.quantity}`)
+          .map((a) => `${a.price.toString()}@${a.quantity.toString()}`)
           .join(', ');
 
         this.logger.warn(
-          `Invalid orderbook for ${normalizedSymbol} after processing queue: bestBid (${bestBid}) >= bestAsk (${bestAsk}). ` +
+          `Invalid orderbook for ${normalizedSymbol} after processing queue: bestBid (${bestBid.toString()}) >= bestAsk (${bestAsk.toString()}). ` +
             `Bids: ${marketData.orderbook.bids.length}, Asks: ${marketData.orderbook.asks.length}. ` +
             `Top bids: [${topBids}], Top asks: [${topAsks}]. Resyncing...`,
         );
@@ -1752,8 +1763,8 @@ export class KrakenWebSocketService
         const priceStr = String(price);
         const qtyStr = String(qty);
         return {
-          price: parseFloat(priceStr),
-          quantity: parseFloat(qtyStr),
+          price: new Decimal(priceStr),
+          quantity: new Decimal(qtyStr),
           originalPrice: priceStr,
           originalQty: qtyStr,
         };
@@ -1785,8 +1796,8 @@ export class KrakenWebSocketService
         }
 
         return {
-          price: parseFloat(priceStr),
-          quantity: parseFloat(qtyStr),
+          price: new Decimal(priceStr),
+          quantity: new Decimal(qtyStr),
           originalPrice: priceStr,
           originalQty: qtyStr,
         };
@@ -1803,34 +1814,30 @@ export class KrakenWebSocketService
       // If they don't, something is wrong with parseOrderBookEntries
       if (!delta.originalPrice || !delta.originalQty) {
         this.logger.error(
-          `CRITICAL: Delta missing original strings! price=${delta.price}, qty=${delta.quantity}. ` +
+          `CRITICAL: Delta missing original strings! price=${delta.price.toString()}, qty=${delta.quantity.toString()}. ` +
             `This indicates a bug in parseOrderBookEntries. SKIPPING delta to prevent corruption.`,
         );
         continue; // Skip this delta entirely rather than corrupt the orderbook
       }
 
-      // Find existing entry by comparing prices using normalized strings
+      // Find existing entry by comparing price values
+      // Use Decimal comparison for exact matching regardless of string representation
       const existingIndex = currentEntries.findIndex((entry) => {
-        if (entry.originalPrice && delta.originalPrice) {
-          // Normalize to handle "89602.5" vs "89602.50"
-          const entryNormalized = parseFloat(entry.originalPrice).toString();
-          const deltaNormalized = parseFloat(delta.originalPrice).toString();
-          return entryNormalized === deltaNormalized;
-        }
-        // Should never reach here if validation above works
-        return Math.abs(entry.price - delta.price) < 0.0001;
+        // Compare using Decimal values for precise matching
+        return entry.price.equals(delta.price);
       });
 
-      if (delta.quantity === 0) {
+      if (delta.quantity.isZero()) {
         // Remove entry
         if (existingIndex !== -1) {
           currentEntries.splice(existingIndex, 1);
         }
       } else if (existingIndex !== -1) {
         // Update existing entry - use values directly from delta (already validated)
+        currentEntries[existingIndex].price = delta.price;
         currentEntries[existingIndex].quantity = delta.quantity;
-        currentEntries[existingIndex].originalQty = delta.originalQty;
         currentEntries[existingIndex].originalPrice = delta.originalPrice;
+        currentEntries[existingIndex].originalQty = delta.originalQty;
       } else {
         // Add new entry - use delta directly (already validated to have original strings)
         currentEntries.push(delta);
