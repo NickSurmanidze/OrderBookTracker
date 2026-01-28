@@ -79,7 +79,6 @@ export class KrakenWebSocketService
   private validationTimers = new Map<string, NodeJS.Timeout>(); // Debounced validation timers
   private readonly MAX_QUEUE_SIZE = 1000; // Prevent memory issues
   private readonly VALIDATION_DELAY_MS = 100; // Wait 100ms before validating to allow batched updates
-  private checksumVerificationCount = 0; // Counter for periodic checksum verification
 
   constructor(private readonly metricsService: MetricsService) {
     super();
@@ -606,24 +605,9 @@ export class KrakenWebSocketService
           // Synchronous validation after each message processing
           try {
             // Validate orderbook integrity (negative or zero spread)
+            // Note: Checksum validation is now done inside processBookUpdate and processBookSnapshot
+            // to ensure it's verified against the exact state immediately after applying changes
             this.validateOrderbookIntegrity(normalizedSymbol);
-
-            // Validate checksum if available in the message
-            if (queuedMessage.data.checksum !== undefined) {
-              const marketData = this.inMemoryStore[normalizedSymbol];
-              if (marketData) {
-                // Create snapshot for race condition safe validation
-                const orderbookSnapshot = {
-                  asks: [...marketData.orderbook.asks],
-                  bids: [...marketData.orderbook.bids],
-                };
-                this.verifyChecksumWithSnapshot(
-                  normalizedSymbol,
-                  queuedMessage.data.checksum,
-                  orderbookSnapshot,
-                );
-              }
-            }
           } catch (validationError) {
             this.logger.warn(
               `Validation error for ${normalizedSymbol}:`,
@@ -887,11 +871,6 @@ export class KrakenWebSocketService
     this.emit('marketUpdate', symbol);
   }
 
-  private handleBookSnapshot(message: KrakenBookSnapshot): void {
-    // This method is kept for compatibility but now delegates to queue system
-    this.enqueueMessage(message);
-  }
-
   /**
    * Process book update from queue
    */
@@ -964,6 +943,31 @@ export class KrakenWebSocketService
     marketData.orderbook.bids = marketData.orderbook.bids.slice(0, 10);
     marketData.orderbook.asks = marketData.orderbook.asks.slice(0, 10);
 
+    // CRITICAL: Create snapshot immediately after truncation, before any other operations
+    // This ensures we verify the exact state that corresponds to this update's checksum
+    let orderbookSnapshot: {
+      asks: OrderBookEntry[];
+      bids: OrderBookEntry[];
+    } | null = null;
+
+    if ('checksum' in data && typeof data.checksum === 'number') {
+      // Deep clone the orderbook state immediately to avoid race conditions
+      orderbookSnapshot = {
+        asks: marketData.orderbook.asks.map((ask) => ({
+          price: ask.price,
+          quantity: ask.quantity,
+          originalPrice: ask.originalPrice,
+          originalQty: ask.originalQty,
+        })),
+        bids: marketData.orderbook.bids.map((bid) => ({
+          price: bid.price,
+          quantity: bid.quantity,
+          originalPrice: bid.originalPrice,
+          originalQty: bid.originalQty,
+        })),
+      };
+    }
+
     // Recalculate mid-price and spread using standard financial formulas:
     // - Mid-price: The average between the best bid and the best ask
     //   Formula: (Best Bid + Best Ask) / 2
@@ -997,38 +1001,20 @@ export class KrakenWebSocketService
         this.metricsService.getOrderBooksPerMinute(symbol);
     }
 
-    // Verify checksum if provided - reduce frequency to avoid noise from timing issues
-    if ('checksum' in data && typeof data.checksum === 'number') {
-      // Only verify checksums periodically to reduce noise from subtle timing issues
-      // Use a simple counter-based approach to verify every Nth update
-      if (!this.checksumVerificationCount) this.checksumVerificationCount = 0;
-      this.checksumVerificationCount++;
-
-      // Verify every 10th update to reduce noise while still catching major issues
-      if (this.checksumVerificationCount % 10 === 0) {
-        // Capture the exact state we want to verify BEFORE any potential race conditions
-        // Deep clone to ensure complete isolation from future modifications
-        const orderbookSnapshot = {
-          asks: marketData.orderbook.asks.map((ask) => ({
-            price: ask.price,
-            quantity: ask.quantity,
-            originalPrice: ask.originalPrice,
-            originalQty: ask.originalQty,
-          })),
-          bids: marketData.orderbook.bids.map((bid) => ({
-            price: bid.price,
-            quantity: bid.quantity,
-            originalPrice: bid.originalPrice,
-            originalQty: bid.originalQty,
-          })),
-        };
-
-        this.verifyChecksumWithSnapshot(
-          normalizedSymbol,
-          data.checksum,
-          orderbookSnapshot,
-        );
-      }
+    // Verify checksum if provided - must verify immediately while snapshot matches the state
+    if (
+      orderbookSnapshot !== null &&
+      'checksum' in data &&
+      typeof data.checksum === 'number'
+    ) {
+      // CRITICAL: Verify the checksum immediately against the snapshot we just captured
+      // The checksum from Kraken corresponds to the exact orderbook state after this update
+      // If we skip verification and apply more updates, the checksum won't match anymore
+      this.verifyChecksumWithSnapshot(
+        normalizedSymbol,
+        data.checksum,
+        orderbookSnapshot,
+      );
     }
 
     this.emit('marketUpdate', symbol);
@@ -1123,7 +1109,17 @@ export class KrakenWebSocketService
 
   /**
    * Extract exact numeric representation from raw JSON string
-   * This preserves trailing zeros like "90087.0" that JSON parsing normalizes away
+   *
+   * CRITICAL: This function CANNOT be removed!
+   *
+   * Even though we use json-bigint with storeAsString: true, it still strips trailing zeros:
+   * - Kraken sends: "0.00000000" → json-bigint returns: "0"
+   * - Kraken sends: "1.67751120" → json-bigint returns: "1.6775112"
+   *
+   * Kraken's CRC32 checksum calculation uses the EXACT string representation including
+   * trailing zeros. Without this function, all checksum verifications will fail.
+   *
+   * This function extracts the exact string from the raw JSON before json-bigint processes it.
    */
   private extractExactNumbers(
     price: unknown,
@@ -1162,9 +1158,18 @@ export class KrakenWebSocketService
   }
 
   /**
+   * Helper function to safely extract price from orderbook entry
+   * Handles both object format {price, qty} and array format [price, qty]
+   */
+  private getPriceFromEntry(entry: unknown): number {
+    const typedEntry = entry as { price?: unknown; [key: number]: unknown };
+    const priceValue = typedEntry.price ?? typedEntry[0];
+    return parseFloat(String(priceValue));
+  }
+
+  /**
    * Calculate CRC32 checksum using raw Kraken data (preserves precision)
    * Uses top 10 asks (ascending) and top 10 bids (descending)
-   * Note: Kraken sends data already sorted, so we use it as-is
    * @param rawJson - The raw JSON string to extract exact numeric representations
    */
   private calculateChecksumFromRaw(
@@ -1172,10 +1177,19 @@ export class KrakenWebSocketService
     rawBids: unknown[],
     rawJson?: string,
   ): number {
-    // Kraken already sends asks sorted ascending and bids sorted descending
-    // Just take the first 10 of each
-    const top10Asks = rawAsks.slice(0, 10);
-    const top10Bids = rawBids.slice(0, 10);
+    // CRITICAL: Sort asks ascending (lowest first) and bids descending (highest first)
+    // Kraken's checksum is calculated on sorted data
+    const sortedAsks = [...rawAsks].sort((a, b) => {
+      return this.getPriceFromEntry(a) - this.getPriceFromEntry(b); // Ascending
+    });
+
+    const sortedBids = [...rawBids].sort((a, b) => {
+      return this.getPriceFromEntry(b) - this.getPriceFromEntry(a); // Descending
+    });
+
+    // Take top 10 of each
+    const top10Asks = sortedAsks.slice(0, 10);
+    const top10Bids = sortedBids.slice(0, 10);
 
     // Build checksum string: asks first, then bids
     let checksumString = '';
@@ -1397,29 +1411,8 @@ export class KrakenWebSocketService
           `  Top 10 Bids:\n    ${bidDetails.join('\n    ')}`,
       );
 
-      // Now calculate and log the actual checksum string
-      const checksumAskStrings: string[] = [];
-      const checksumBidStrings: string[] = [];
-      for (const ask of top10Asks) {
-        const formatted = this.formatPriceLevelForChecksum(ask);
-        checksumAskStrings.push(formatted);
-      }
-      for (const bid of top10Bids) {
-        const formatted = this.formatPriceLevelForChecksum(bid);
-        checksumBidStrings.push(formatted);
-      }
-      const fullChecksumString =
-        checksumAskStrings.join('') + checksumBidStrings.join('');
-
-      this.logger.debug(
-        `CHECKSUM STRING BREAKDOWN:\n` +
-          `  Ask formatted: [${checksumAskStrings.join(', ')}]\n` +
-          `  Bid formatted: [${checksumBidStrings.join(', ')}]\n` +
-          `  Full checksum string: "${fullChecksumString}"\n` +
-          `  String length: ${fullChecksumString.length}\n` +
-          `  Note: Asks sorted ascending (${top10Asks[0]?.price} to ${top10Asks[9]?.price}), ` +
-          `Bids sorted descending (${top10Bids[0]?.price} to ${top10Bids[9]?.price})`,
-      );
+      // Recalculate with debug logging to show the exact checksum string used
+      this.calculateChecksumFromSnapshot(orderbookSnapshot, true);
 
       this.resyncMarket(normalizedSymbol);
     }
@@ -1427,18 +1420,21 @@ export class KrakenWebSocketService
 
   /**
    * Calculate checksum from orderbook snapshot (race condition safe)
+   * Assumes snapshot is already sorted and truncated to top 10 levels
    */
-  private calculateChecksumFromSnapshot(orderbookSnapshot: {
-    asks: OrderBookEntry[];
-    bids: OrderBookEntry[];
-  }): number {
+  private calculateChecksumFromSnapshot(
+    orderbookSnapshot: {
+      asks: OrderBookEntry[];
+      bids: OrderBookEntry[];
+    },
+    debugLog: boolean = false,
+  ): number {
     const { asks, bids } = orderbookSnapshot;
 
-    // Get top 10 asks sorted ascending (lowest to highest)
-    const top10Asks = [...asks].sort((a, b) => a.price - b.price).slice(0, 10);
-
-    // Get top 10 bids sorted descending (highest to lowest)
-    const top10Bids = [...bids].sort((a, b) => b.price - a.price).slice(0, 10);
+    // Snapshot should already be sorted and truncated to 10 levels from processBookUpdate
+    // Do NOT sort again as it may cause subtle ordering issues with floating point prices
+    const top10Asks = asks.slice(0, 10);
+    const top10Bids = bids.slice(0, 10);
 
     // Check if we have originalPrice/originalQty preserved
     const asksWithOriginal = top10Asks.filter((a) => a.originalPrice).length;
@@ -1455,6 +1451,8 @@ export class KrakenWebSocketService
     // Build checksum string: asks first, then bids
     // ALWAYS use original strings when available for accurate checksum
     let checksumString = '';
+    const debugParts: string[] | null = debugLog ? [] : null;
+
     for (const ask of top10Asks) {
       if (ask.originalPrice && ask.originalQty) {
         const formatted = this.formatPriceLevelForChecksumFromStrings(
@@ -1462,10 +1460,20 @@ export class KrakenWebSocketService
           ask.originalQty,
         );
         checksumString += formatted;
+        if (debugLog && debugParts) {
+          debugParts.push(
+            `ASK ${ask.originalPrice}/${ask.originalQty} → ${formatted}`,
+          );
+        }
       } else {
         // Fallback to converted values if original strings not available (will cause mismatch)
         const formatted = this.formatPriceLevelForChecksum(ask);
         checksumString += formatted;
+        if (debugLog && debugParts) {
+          debugParts.push(
+            `ASK ${ask.price}/${ask.quantity} [NO ORIG] → ${formatted}`,
+          );
+        }
       }
     }
     for (const bid of top10Bids) {
@@ -1475,11 +1483,29 @@ export class KrakenWebSocketService
           bid.originalQty,
         );
         checksumString += formatted;
+        if (debugLog && debugParts) {
+          debugParts.push(
+            `BID ${bid.originalPrice}/${bid.originalQty} → ${formatted}`,
+          );
+        }
       } else {
         // Fallback to converted values if original strings not available (will cause mismatch)
         const formatted = this.formatPriceLevelForChecksum(bid);
         checksumString += formatted;
+        if (debugLog && debugParts) {
+          debugParts.push(
+            `BID ${bid.price}/${bid.quantity} [NO ORIG] → ${formatted}`,
+          );
+        }
       }
+    }
+
+    // Log the exact checksum calculation only when requested
+    if (debugLog && debugParts) {
+      this.logger.debug(
+        `Checksum calculation breakdown:\n${debugParts.join('\n')}\n` +
+          `Full string: "${checksumString}" (length: ${checksumString.length})`,
+      );
     }
 
     // Calculate CRC32 using buffer-crc32 - Kraken expects Big Endian byte order
@@ -1737,7 +1763,9 @@ export class KrakenWebSocketService
         let priceStr = String(entryObj.price);
         let qtyStr = String(entryObj.qty);
 
-        // Try to extract exact representation from raw JSON if available
+        // CRITICAL: Extract exact representation from raw JSON to preserve trailing zeros
+        // json-bigint strips trailing zeros ("0.00000000" → "0"), but Kraken's checksum
+        // requires the exact string representation including trailing zeros
         if (rawJson) {
           const extracted = this.extractExactNumbers(
             entryObj.price,
@@ -1747,6 +1775,12 @@ export class KrakenWebSocketService
           if (extracted) {
             priceStr = extracted.price;
             qtyStr = extracted.qty;
+          } else {
+            // Log when extraction fails - this might indicate a problem
+            this.logger.warn(
+              `Failed to extract exact numbers for price=${entryObj.price}, qty=${entryObj.qty}. ` +
+                `Using json-bigint values which may lack trailing zeros.`,
+            );
           }
         }
 
@@ -1765,9 +1799,27 @@ export class KrakenWebSocketService
     deltas: OrderBookEntry[],
   ): void {
     for (const delta of deltas) {
-      const existingIndex = currentEntries.findIndex(
-        (entry) => entry.price === delta.price,
-      );
+      // CRITICAL: All deltas MUST have original strings for accurate checksums
+      // If they don't, something is wrong with parseOrderBookEntries
+      if (!delta.originalPrice || !delta.originalQty) {
+        this.logger.error(
+          `CRITICAL: Delta missing original strings! price=${delta.price}, qty=${delta.quantity}. ` +
+            `This indicates a bug in parseOrderBookEntries. SKIPPING delta to prevent corruption.`,
+        );
+        continue; // Skip this delta entirely rather than corrupt the orderbook
+      }
+
+      // Find existing entry by comparing prices using normalized strings
+      const existingIndex = currentEntries.findIndex((entry) => {
+        if (entry.originalPrice && delta.originalPrice) {
+          // Normalize to handle "89602.5" vs "89602.50"
+          const entryNormalized = parseFloat(entry.originalPrice).toString();
+          const deltaNormalized = parseFloat(delta.originalPrice).toString();
+          return entryNormalized === deltaNormalized;
+        }
+        // Should never reach here if validation above works
+        return Math.abs(entry.price - delta.price) < 0.0001;
+      });
 
       if (delta.quantity === 0) {
         // Remove entry
@@ -1775,15 +1827,12 @@ export class KrakenWebSocketService
           currentEntries.splice(existingIndex, 1);
         }
       } else if (existingIndex !== -1) {
-        // Update existing entry - preserve original strings from delta
+        // Update existing entry - use values directly from delta (already validated)
         currentEntries[existingIndex].quantity = delta.quantity;
         currentEntries[existingIndex].originalQty = delta.originalQty;
-        // Price doesn't change but update original if provided
-        if (delta.originalPrice) {
-          currentEntries[existingIndex].originalPrice = delta.originalPrice;
-        }
+        currentEntries[existingIndex].originalPrice = delta.originalPrice;
       } else {
-        // Add new entry
+        // Add new entry - use delta directly (already validated to have original strings)
         currentEntries.push(delta);
       }
     }

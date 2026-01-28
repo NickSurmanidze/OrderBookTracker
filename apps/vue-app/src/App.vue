@@ -441,6 +441,88 @@ const getTimeSinceUpdate = (market: TrackedMarket): string => {
   }
   return `${elapsed}ms`;
 };
+
+const getTimeSinceUpdateMs = (market: TrackedMarket): number => {
+  if (!market.data?.lastOrderbookUpdate) return 0;
+  const lastUpdate = new Date(market.data.lastOrderbookUpdate).getTime();
+  return currentTime.value - lastUpdate;
+};
+
+// Determine if data is stale based on time since last update
+const getDataFreshnessStatus = (
+  market: TrackedMarket,
+): 'fresh' | 'stale' | 'very-stale' => {
+  const elapsed = getTimeSinceUpdateMs(market);
+  if (elapsed > 60000) return 'very-stale'; // > 60 seconds
+  if (elapsed > 5000) return 'stale'; // > 5 seconds
+  return 'fresh';
+};
+
+// Spread quality thresholds and indicators
+const getSpreadStatus = (
+  spread: string | undefined,
+): {
+  quality: 'excellent' | 'good' | 'fair' | 'wide' | 'very-wide';
+  icon: string;
+  label: string;
+} => {
+  if (!spread) return { quality: 'fair', icon: '', label: 'N/A' };
+
+  const spreadPercentage = parseFloat(spread);
+  if (isNaN(spreadPercentage))
+    return { quality: 'fair', icon: '', label: 'N/A' };
+
+  // Spread thresholds:
+  // Excellent: < 0.01% - Very tight spread, highly liquid market
+  // Good: 0.01% - 0.1% - Normal for liquid markets
+  // Fair: 0.1% - 0.5% - Acceptable spread
+  // Wide: 0.5% - 1% - Getting wide, caution advised
+  // Very Wide: > 1% - Very wide spread, illiquid market
+
+  if (spreadPercentage < 0.01) {
+    return { quality: 'excellent', icon: '✓', label: 'Excellent' };
+  } else if (spreadPercentage < 0.1) {
+    return { quality: 'good', icon: '✓', label: 'Good' };
+  } else if (spreadPercentage < 0.5) {
+    return { quality: 'fair', icon: '○', label: 'Fair' };
+  } else if (spreadPercentage < 1.0) {
+    return { quality: 'wide', icon: '⚠', label: 'Wide' };
+  } else {
+    return { quality: 'very-wide', icon: '⚠', label: 'Very Wide' };
+  }
+};
+
+// Orderbook speed quality indicators
+const getSpeedStatus = (
+  speed: number | undefined,
+): {
+  quality: 'very-active' | 'active' | 'normal' | 'slow' | 'very-slow';
+  color: string;
+  label: string;
+} => {
+  if (speed === undefined || speed === null) {
+    return { quality: 'normal', color: '#666', label: 'Unknown' };
+  }
+
+  // Speed thresholds (orderbooks per minute):
+  // Very Active: > 100 ob/min - Extremely liquid, high-frequency updates
+  // Active: 50-100 ob/min - Very liquid market
+  // Normal: 10-50 ob/min - Healthy update frequency
+  // Slow: 1-10 ob/min - Lower liquidity
+  // Very Slow: < 1 ob/min - Illiquid or stale data
+
+  if (speed > 100) {
+    return { quality: 'very-active', color: '#10b981', label: 'Very Active' };
+  } else if (speed > 50) {
+    return { quality: 'active', color: '#3b82f6', label: 'Active' };
+  } else if (speed > 10) {
+    return { quality: 'normal', color: '#999', label: 'Normal' };
+  } else if (speed > 1) {
+    return { quality: 'slow', color: '#f59e0b', label: 'Slow' };
+  } else {
+    return { quality: 'very-slow', color: '#ef4444', label: 'Very Slow' };
+  }
+};
 </script>
 
 <template>
@@ -470,6 +552,79 @@ const getTimeSinceUpdate = (market: TrackedMarket): string => {
           🔴 Disconnected
         </div>
       </div>
+
+      <!-- Legend -->
+      <div class="legend">
+        <div class="legend-section">
+          <h4>Spread Quality</h4>
+          <div class="legend-items">
+            <div class="legend-item">
+              <span class="legend-icon spread-excellent">✓</span>
+              <span class="legend-label">Excellent (&lt;0.01%)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon spread-good">✓</span>
+              <span class="legend-label">Good (0.01-0.1%)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon spread-fair">○</span>
+              <span class="legend-label">Fair (0.1-0.5%)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon spread-wide">⚠</span>
+              <span class="legend-label">Wide (0.5-1%)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon spread-very-wide">⚠</span>
+              <span class="legend-label">Very Wide (&gt;1%)</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="legend-section">
+          <h4>Data Freshness</h4>
+          <div class="legend-items">
+            <div class="legend-item">
+              <span class="legend-icon freshness-fresh">⬤</span>
+              <span class="legend-label">Fresh (&lt;5s)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon freshness-stale">🟡</span>
+              <span class="legend-label">Stale (5-60s)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon freshness-very-stale">🔴</span>
+              <span class="legend-label">Very Stale (&gt;60s)</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="legend-section">
+          <h4>Update Frequency</h4>
+          <div class="legend-items">
+            <div class="legend-item">
+              <span class="legend-icon speed-very-active">●</span>
+              <span class="legend-label">Very Active (&gt;100/min)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon speed-active">●</span>
+              <span class="legend-label">Active (50-100/min)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon speed-normal">●</span>
+              <span class="legend-label">Normal (10-50/min)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon speed-slow">●</span>
+              <span class="legend-label">Slow (1-10/min)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-icon speed-very-slow">●</span>
+              <span class="legend-label">Very Slow (&lt;1/min)</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </header>
 
     <div class="widgets-container">
@@ -481,17 +636,57 @@ const getTimeSinceUpdate = (market: TrackedMarket): string => {
       >
         <div class="widget-header">
           <div class="widget-title-row">
-            <h3>{{ market.symbol }}</h3>
-            <span class="update-time" title="Time since last orderbook update">
+            <h3>
+              <a
+                :href="`https://pro.kraken.com/app/trade/${market.symbol.replace('/', '-')}`"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="market-link"
+                :title="`Check ${market.symbol} on Kraken`"
+              >
+                {{ market.symbol }}
+              </a>
+            </h3>
+            <span
+              class="update-time"
+              :class="{
+                stale: getDataFreshnessStatus(market) === 'stale',
+                'very-stale': getDataFreshnessStatus(market) === 'very-stale',
+              }"
+              :title="
+                getDataFreshnessStatus(market) === 'very-stale'
+                  ? 'No updates for over 60 seconds - data may be stale!'
+                  : getDataFreshnessStatus(market) === 'stale'
+                    ? 'No updates for over 5 seconds'
+                    : 'Time since last orderbook update'
+              "
+            >
+              <span
+                v-if="getDataFreshnessStatus(market) !== 'fresh'"
+                class="staleness-icon"
+              >
+                {{
+                  getDataFreshnessStatus(market) === 'very-stale' ? '🔴' : '🟡'
+                }}
+              </span>
               <span class="time-value">{{ getTimeSinceUpdate(market) }}</span>
             </span>
-            <span v-if="market.data" class="orderbook-speed"
-              >({{ market.data.orderbookSpeed || 0 }} ob/min)</span
+            <span
+              v-if="market.data"
+              class="orderbook-speed"
+              :style="{
+                color: getSpeedStatus(market.data.orderbookSpeed).color,
+              }"
+              :title="`Update Frequency: ${getSpeedStatus(market.data.orderbookSpeed).label}`"
             >
+              ({{ market.data.orderbookSpeed || 0 }} ob/min)
+            </span>
           </div>
-          <button @click="removeMarket(market.symbol)" class="close-btn">
-            ×
-          </button>
+          <div class="header-actions">
+            <button @click="removeMarket(market.symbol)" class="close-btn">
+              ×
+            </button>
+          </div>
         </div>
 
         <div class="widget-content">
@@ -528,8 +723,17 @@ const getTimeSinceUpdate = (market: TrackedMarket): string => {
               <div class="mid-price">
                 {{ formatMidPrice(market.data.midPrice, market.symbol) }}
               </div>
-              <div class="spread">
-                {{ formatSpread(market.data.spread) }}
+              <div
+                class="spread"
+                :class="`spread-${getSpreadStatus(market.data.spread).quality}`"
+                :title="`Spread Quality: ${getSpreadStatus(market.data.spread).label}`"
+              >
+                <span class="spread-icon">{{
+                  getSpreadStatus(market.data.spread).icon
+                }}</span>
+                <span class="spread-value">{{
+                  formatSpread(market.data.spread)
+                }}</span>
               </div>
             </div>
 
@@ -661,6 +865,110 @@ body {
   letter-spacing: 2px;
 }
 
+.legend {
+  display: flex;
+  gap: 40px;
+  margin-top: 20px;
+  padding: 15px 25px;
+  background-color: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  border: 1px solid #404040;
+}
+
+.legend-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.legend-section h4 {
+  color: #999;
+  font-size: 0.75em;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+
+.legend-items {
+  display: flex;
+  gap: 15px;
+  flex-wrap: wrap;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-icon {
+  font-size: 1.2em;
+  line-height: 1;
+  font-weight: bold;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.legend-icon.spread-excellent {
+  color: #10b981;
+}
+
+.legend-icon.spread-good {
+  color: #3b82f6;
+}
+
+.legend-icon.spread-fair {
+  color: #ffd700;
+}
+
+.legend-icon.spread-wide {
+  color: #f59e0b;
+}
+
+.legend-icon.spread-very-wide {
+  color: #ef4444;
+}
+
+.legend-icon.freshness-fresh {
+  color: #999;
+  font-size: 0.8em;
+}
+
+.legend-icon.freshness-stale {
+  font-size: 1em;
+}
+
+.legend-icon.freshness-very-stale {
+  font-size: 1em;
+}
+
+.legend-icon.speed-very-active {
+  color: #10b981;
+}
+
+.legend-icon.speed-active {
+  color: #3b82f6;
+}
+
+.legend-icon.speed-normal {
+  color: #999;
+}
+
+.legend-icon.speed-slow {
+  color: #f59e0b;
+}
+
+.legend-icon.speed-very-slow {
+  color: #ef4444;
+}
+
+.legend-label {
+  color: #ccc;
+  font-size: 0.85em;
+}
+
 .widgets-container {
   display: flex;
   flex-wrap: wrap;
@@ -706,6 +1014,19 @@ body {
   font-weight: 500;
 }
 
+.market-link {
+  color: #fff;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: color 0.2s ease;
+}
+
+.market-link:hover {
+  color: #007acc;
+}
+
 .update-time {
   color: #999;
   font-size: 0.85em;
@@ -714,6 +1035,33 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
+  transition: color 0.3s ease;
+}
+
+.update-time.stale {
+  color: #f59e0b;
+}
+
+.update-time.very-stale {
+  color: #ef4444;
+  font-weight: 600;
+}
+
+.staleness-icon {
+  font-size: 1.1em;
+  line-height: 1;
+  transform: translateY(-1px);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
 }
 
 .time-value {
@@ -723,12 +1071,11 @@ body {
 }
 
 .orderbook-speed {
-  color: #007acc;
   font-weight: 500;
   font-size: 0.85em;
-  font-weight: 500;
   margin-left: 12px;
   margin-right: 20px;
+  transition: color 0.3s ease;
 }
 
 .close-btn {
@@ -868,9 +1215,66 @@ body {
   padding: 12px;
   background-color: rgba(255, 255, 255, 0.05);
   border-radius: 4px;
-  color: #ffd700;
   font-weight: 700;
   font-size: 0.9em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.3s ease;
+}
+
+/* Spread quality color coding */
+.spread-excellent {
+  color: #10b981;
+  background-color: rgba(16, 185, 129, 0.1);
+  border: 1px solid rgba(16, 185, 129, 0.3);
+}
+
+.spread-good {
+  color: #3b82f6;
+  background-color: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.spread-fair {
+  color: #ffd700;
+  background-color: rgba(255, 215, 0, 0.1);
+  border: 1px solid rgba(255, 215, 0, 0.3);
+}
+
+.spread-wide {
+  color: #f59e0b;
+  background-color: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.spread-very-wide {
+  color: #ef4444;
+  background-color: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  animation: subtle-pulse 3s ease-in-out infinite;
+}
+
+@keyframes subtle-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+  }
+  50% {
+    box-shadow: 0 0 8px 2px rgba(239, 68, 68, 0.3);
+  }
+}
+
+.spread-icon {
+  font-size: 1.3em;
+  font-weight: bold;
+  line-height: 1;
+  transform: translateY(-1px);
+}
+
+.spread-value {
+  font-family: 'Courier New', monospace;
 }
 
 .add-market-widget .widget-content {
