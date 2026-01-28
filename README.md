@@ -1,105 +1,68 @@
-# Orderbook Feed Monorepo
+# Order Book Spread Tracker
 
-This is a Turborepo monorepo containing a Vue.js frontend and a NestJS backend application.
+This application displays real-time order book information for multiple Kraken markets.
+It allows users to monitor basic market health metrics such as spread and update speed.
 
-## Applications
+## Overview
 
-- **vue-app**: Vue.js application running on port 3000
-- **nestjs-app**: NestJS backend application running on port 4000
+The system consists of:
+• Backend (NestJS)
+Connects to the Kraken WebSocket API, maintains local order book state, computes derived metrics, and streams updates to clients.
+• Frontend (Vue 3)
+Displays real-time data and allows users to select which markets to track.
 
-## Getting Started
+A backend layer is used to centralize exchange connectivity and to control the rate at which updates are sent to the UI.
 
-### Prerequisites
+## Running the application locally
 
-- Node.js (>=18)
-- pnpm
+Prerequisites
+• Node.js (LTS)
+• pnpm
 
-### Installation
+Steps 1. Install dependencies
+`pnpm install `
 
-```bash
-pnpm install
-```
+2. Start the application
+   `pnpm dev `
 
-### Development
+3. Open in browser
+   `http://localhost:3000`
 
-To run all applications in development mode:
+If the frontend starts before the backend WebSocket server is ready, a browser refresh may be required.
 
-```bash
-pnpm dev
-```
+## How it works
 
-To run applications individually:
+## Frontend
 
-```bash
-# Run only Vue.js app (port 3000)
-pnpm dev:vue
+    •	The frontend opens a single WebSocket connection to the backend.
+    •	Users can dynamically add or remove markets to track.
+    •	Each market widget displays:
+    •	Top 3 bids and asks
+    •	Mid-price
+    •	Spread (percentage)
+    •	Order book update speed
+    •	Supported markets and rounding precision are fetched from a backend REST endpoint.
 
-# Run only NestJS app (port 4000)
-pnpm dev:nestjs
-```
+## Backend
 
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+    •	The backend keeps an in-memory registry of markets requested by at least one connected client.
+    •	A market is subscribed to on Kraken only if it has active frontend subscribers.
+    •	When no clients remain, the market is unsubscribed.
 
-````
-# With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended)
-turbo build --filter=docs
+## Order book processing
 
-# Without [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation), use your package manager
-npx turbo build --filter=docs
-yarn exec turbo build --filter=docs
-pnpm exec turbo build --filter=docs
-### Building
+    •	For each market:
+    •	An initial snapshot is received from Kraken.
+    •	Incremental updates are applied sequentially to the local snapshot.
+    •	A checksum is computed and validated to detect inconsistencies.
+    •	If invalid state is detected (e.g. negative spread, checksum mismatch), the local order book is discarded and resynchronized.
 
-```bash
-pnpm build
-````
+## pdate handling
 
-### Other Commands
+    •	Incoming Kraken messages are queued per market and processed sequentially.
+    •	Updates sent to frontend clients are throttled to limit re-rendering frequency.
 
-```bash
-# Lint all packages
-pnpm lint
+## Order book speed
 
-# Type checking
-pnpm check-types
-
-# Format code
-pnpm format
-```
-
-## Project Structure
-
-```
-├── apps/
-│   ├── vue-app/        # Vue.js frontend (port 3000)
-│   └── nestjs-app/     # NestJS backend (port 4000)
-├── packages/
-│   ├── eslint-config/  # Shared ESLint configuration
-│   ├── typescript-config/ # Shared TypeScript configuration
-│   └── ui/             # Shared UI components
-├── package.json
-├── pnpm-workspace.yaml
-└── turbo.json
-```
-
-## Remote Caching
-
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-To enable Remote Caching:
-
-```bash
-pnpm dlx turbo login
-pnpm dlx turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)
+    •	Update speed is computed as a rolling count of order book updates over the last 60 seconds.
+    •	This metric is used to detect inactive or stalled markets.

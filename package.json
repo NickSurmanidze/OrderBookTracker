@@ -2,21 +2,24 @@
   "name": "orderbook-feed",
   "private": true,
   "scripts": {
-    "build": "turbo run build",
-    "dev": "turbo run dev",
-    "dev:vue": "turbo run dev --filter=vue-app",
-    "dev:nestjs": "turbo run dev --filter=nestjs-app",
-    "lint": "turbo run lint",
+    "build": "pnpm --parallel -r run build",
+    "dev": "concurrently \"pnpm --filter vue-app run dev\" \"pnpm --filter nestjs-app run dev\"",
+    "dev:vue": "pnpm --filter vue-app run dev",
+    "dev:nestjs": "pnpm --filter nestjs-app run dev",
+    "lint": "pnpm --parallel -r run lint",
     "format": "prettier --write \"**/*.{ts,tsx,md}\"",
-    "check-types": "turbo run check-types"
+    "check-types": "pnpm --parallel -r run check-types"
   },
   "devDependencies": {
+    "concurrently": "^9.2.1",
     "prettier": "^3.7.4",
-    "turbo": "^2.7.6",
     "typescript": "5.9.2"
   },
   "packageManager": "pnpm@9.0.0",
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@aws-crypto/crc32": "^5.2.0"
   }
 }

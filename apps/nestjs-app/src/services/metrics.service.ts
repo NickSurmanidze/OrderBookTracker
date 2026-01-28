@@ -5,6 +5,7 @@ interface OrderBookMetricsBucket {
   count: number;
 }
 
+// Tracks metrics related to order book updates per symbol per minute
 @Injectable()
 export class MetricsService {
   private readonly logger = new Logger(MetricsService.name);
@@ -74,17 +75,32 @@ export class MetricsService {
   }
 
   /**
-   * Remove all metrics for a symbol
+   * Check if a symbol has any active metrics (count > 0)
    */
-  removeSymbolMetrics(symbol: string): void {
-    this.buckets.delete(symbol);
-    this.logger.debug(`Removed metrics for symbol: ${symbol}`);
+  hasActiveMetrics(symbol: string): boolean {
+    const count = this.getOrderBooksPerMinute(symbol);
+    return count > 0;
   }
 
   /**
-   * Get all tracked symbols
+   * Remove all metrics for a symbol only if they have decayed to 0
+   * Called periodically to clean up inactive symbols
    */
-  getTrackedSymbols(): string[] {
-    return Array.from(this.buckets.keys());
+  removeSymbolMetricsIfInactive(symbol: string): boolean {
+    if (!this.hasActiveMetrics(symbol)) {
+      this.buckets.delete(symbol);
+      this.logger.debug(`Removed inactive metrics for symbol: ${symbol}`);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Force remove all metrics for a symbol immediately
+   * Only use when symbol is invalid or permanently removed
+   */
+  forceRemoveSymbolMetrics(symbol: string): void {
+    this.buckets.delete(symbol);
+    this.logger.debug(`Force removed metrics for symbol: ${symbol}`);
   }
 }

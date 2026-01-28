@@ -12,9 +12,9 @@ async function bootstrap() {
   // Enable WebSocket adapter
   app.useWebSocketAdapter(new IoAdapter(app));
 
-  // Enable CORS for development
+  // Enable CORS
   app.enableCors({
-    origin: 'http://localhost:3000', // Vue.js app
+    origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
     credentials: true,
   });
 

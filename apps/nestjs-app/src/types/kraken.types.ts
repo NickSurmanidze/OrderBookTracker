@@ -51,6 +51,8 @@ export interface KrakenSubscriptionStatus {
 export interface OrderBookEntry {
   price: number;
   quantity: number;
+  originalPrice?: string; // Original string from JSON to preserve precision for checksums
+  originalQty?: string; // Original string from JSON to preserve precision for checksums
 }
 
 export interface OrderBook {
@@ -69,6 +71,7 @@ export interface MarketData {
     bids: OrderBookEntry[];
     asks: OrderBookEntry[];
     lastUpdate: string;
+    lastProcessedTimestamp?: string; // Last Kraken timestamp we processed to enforce ordering
   };
   subscriptionStatus:
     | 'subscribing'
