@@ -1,3 +1,5 @@
+import { Decimal } from 'decimal.js';
+
 export interface KrakenBookSnapshot {
   channel: 'book';
   type: 'snapshot';
@@ -47,8 +49,6 @@ export interface KrakenSubscriptionStatus {
   time_out: string;
   req_id?: number;
 }
-
-import { Decimal } from 'decimal.js';
 
 export interface OrderBookEntry {
   price: Decimal; // Use Decimal for precise arithmetic
