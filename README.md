@@ -58,9 +58,6 @@ If the frontend starts before the backend WebSocket server is ready, a browser r
     •	Incremental updates are applied sequentially to the local snapshot.
     •	A checksum is computed and validated to detect inconsistencies.
     •	If invalid state is detected (e.g. negative spread, checksum mismatch), the local order book is discarded and resynchronized.
-
-## date handling
-
     •	Incoming Kraken messages are queued per market and processed sequentially.
     •	Updates sent to frontend clients are throttled to limit re-rendering frequency.
 
@@ -68,3 +65,9 @@ If the frontend starts before the backend WebSocket server is ready, a browser r
 
     •	Update speed is computed as a rolling count of order book updates over the last 60 seconds.
     •	This metric is used to detect inactive or stalled markets.
+
+## Potential improvements
+
+    •	Checksum is failing sometimes, which needs to be investigated further, we currently handle it with market resync. Happens once per 500 updates or so.
+    •	Would be nicer to have internal unified data structure and adaptors for different exchanges. This would be a clean way to support multiple exchanges.
+    •	WS connection redundancy - sometimes WS connections break and we auto-reconnect but since this happens randomly we could already have a backup connection and feed data fom both to minimize chances of live feed downtime.
