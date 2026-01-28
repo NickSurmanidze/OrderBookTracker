@@ -40,14 +40,16 @@ If the frontend starts before the backend WebSocket server is ready, a browser r
     •	Top 3 bids and asks
     •	Mid-price
     •	Spread (percentage)
-    •	Order book update speed
+    •	Order book update speed (ob updates over last 60 seconds)
     •	Supported markets and rounding precision are fetched from a backend REST endpoint.
+    •	Time since last orderbook update.
 
 ## Backend
 
     •	The backend keeps an in-memory registry of markets requested by at least one connected client.
     •	A market is subscribed to on Kraken only if it has active frontend subscribers.
     •	When no clients remain, the market is unsubscribed.
+    •	If local cache gets out of sync we re-sync immediately so the front-end always gets correct data.
 
 ## Order book processing
 
@@ -57,7 +59,7 @@ If the frontend starts before the backend WebSocket server is ready, a browser r
     •	A checksum is computed and validated to detect inconsistencies.
     •	If invalid state is detected (e.g. negative spread, checksum mismatch), the local order book is discarded and resynchronized.
 
-## pdate handling
+## date handling
 
     •	Incoming Kraken messages are queued per market and processed sequentially.
     •	Updates sent to frontend clients are throttled to limit re-rendering frequency.
