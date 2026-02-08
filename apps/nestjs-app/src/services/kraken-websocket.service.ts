@@ -16,9 +16,9 @@ import {
   KrakenBookUpdate,
   KrakenSubscriptionMessage,
   KrakenSubscriptionStatus,
-  OrderBookEntry,
-  MarketData,
-} from '../types/kraken.types';
+  KrakenInstrumentPair,
+} from '../schemas/kraken.schema';
+import { OrderBookEntry, MarketData } from '../types/types';
 import { KrakenWebSocketMessageSchema } from '../schemas/kraken.schema';
 
 interface QueuedMessage {
@@ -72,6 +72,15 @@ export class KrakenWebSocketService
 
   // In-memory store for caching market data
   private inMemoryStore: { [symbol: string]: MarketData } = {};
+
+  // Instrument channel cache: available pairs and their precisions from Kraken WS
+  private instrumentPairs: KrakenInstrumentPair[] = [];
+  private cachedAvailableMarkets: string[] = [];
+  private cachedMarketPrecisions: Record<
+    string,
+    { price: number; volume: number }
+  > = {};
+  private instrumentDataReady = false;
 
   // Queue system for ordered message processing
   private symbolQueues = new Map<string, QueuedMessage[]>();
@@ -141,6 +150,8 @@ export class KrakenWebSocketService
         }
         this.emit('connected');
 
+        // Subscribe to instrument channel to get available pairs and precisions
+        this.subscribeToInstrumentChannel();
         // Auto-subscribe to markets after connection
         setTimeout(() => {
           const existingMarkets = Object.keys(this.inMemoryStore);
@@ -798,16 +809,29 @@ export class KrakenWebSocketService
 
     // Handle book data
     if ('channel' in message) {
-      const bookMessage = message as {
+      const channelMessage = message as {
         channel: string;
         type?: string;
         data?: any;
       };
-      if (bookMessage.channel === 'book') {
-        if (bookMessage.type === 'snapshot') {
-          this.enqueueMessage(bookMessage as KrakenBookSnapshot, rawJson);
-        } else if (bookMessage.type === 'update') {
-          this.enqueueMessage(bookMessage as KrakenBookUpdate, rawJson);
+
+      if (channelMessage.channel === 'instrument') {
+        const instrType: string = String(channelMessage.type ?? '');
+        const instrData = channelMessage.data as
+          | { pairs?: unknown[] }
+          | undefined;
+        const instrPairs: KrakenInstrumentPair[] = (
+          Array.isArray(instrData?.pairs) ? instrData.pairs : []
+        ) as KrakenInstrumentPair[];
+        this.handleInstrumentMessage(instrType, instrPairs);
+        return;
+      }
+
+      if (channelMessage.channel === 'book') {
+        if (channelMessage.type === 'snapshot') {
+          this.enqueueMessage(channelMessage as KrakenBookSnapshot, rawJson);
+        } else if (channelMessage.type === 'update') {
+          this.enqueueMessage(channelMessage as KrakenBookUpdate, rawJson);
         }
       }
     }
@@ -1040,7 +1064,7 @@ export class KrakenWebSocketService
       | OrderBookEntry
       | { price: unknown; qty?: unknown; quantity?: unknown }
       | unknown[],
-    rawJson?: string,
+    exactNumbersMap?: Map<string, { price: string; qty: string }>,
   ): string {
     let priceStr: string;
     let qtyStr: string;
@@ -1051,16 +1075,13 @@ export class KrakenWebSocketService
       qtyStr = String(entry[1]);
     } else if ('qty' in entry) {
       // Raw Kraken object format: {price, qty}
-      // If we have raw JSON, try to extract the exact numeric representation
-      if (rawJson) {
-        const extracted = this.extractExactNumbers(
-          entry.price,
-          entry.qty,
-          rawJson,
-        );
-        if (extracted) {
-          priceStr = extracted.price;
-          qtyStr = extracted.qty;
+      // Look up exact representation from pre-built map
+      if (exactNumbersMap) {
+        const key = `${this.normalizeNumberString(String(entry.price))}|${this.normalizeNumberString(String(entry.qty))}`;
+        const exact = exactNumbersMap.get(key);
+        if (exact) {
+          priceStr = exact.price;
+          qtyStr = exact.qty;
         } else {
           priceStr = String(entry.price);
           qtyStr = String(entry.qty);
@@ -1115,7 +1136,8 @@ export class KrakenWebSocketService
   }
 
   /**
-   * Extract exact numeric representation from raw JSON string
+   * Extract ALL price/qty pairs from raw JSON in a single pass, preserving exact
+   * string representation including trailing zeros.
    *
    * CRITICAL: This function CANNOT be removed!
    *
@@ -1126,42 +1148,66 @@ export class KrakenWebSocketService
    * Kraken's CRC32 checksum calculation uses the EXACT string representation including
    * trailing zeros. Without this function, all checksum verifications will fail.
    *
-   * This function extracts the exact string from the raw JSON before json-bigint processes it.
+   * Returns a Map keyed by "normalizedPrice|normalizedQty" → { price, qty } with exact strings.
+   * By extracting ALL pairs in one pass we avoid the previous per-entry regex approach which
+   * could match the wrong entry when one price was a numeric prefix of another.
    */
-  private extractExactNumbers(
-    price: unknown,
-    qty: unknown,
+  private extractAllExactNumbers(
     rawJson: string,
-  ): { price: string; qty: string } | null {
-    try {
-      // Convert to strings for searching (these are already normalized by json-bigint)
-      const priceNormalized = String(price);
-      const qtyNormalized = String(qty);
+  ): Map<string, { price: string; qty: string }> {
+    const result = new Map<string, { price: string; qty: string }>();
 
-      // Build a regex to find this exact price/qty pair in the raw JSON
-      // Look for: "price":<number>,"qty":<number>
-      // The <number> can be integer or decimal with any precision, including trailing zeros
-      const escapedPrice = priceNormalized.replace(/\./g, '\\.');
-      const escapedQty = qtyNormalized.replace(/\./g, '\\.');
+    // Match ALL occurrences of "price":<number>,"qty":<number> in the raw JSON.
+    // The regex uses [,}\s] lookahead after qty to ensure we capture the full number
+    // and don't stop short or overshoot into the next field.
+    const pattern = /"price":(\d+(?:\.\d+)?),\s*"qty":(\d+(?:\.\d+)?)/g;
+    let match: RegExpExecArray | null;
 
-      // This regex matches the exact normalized value followed by optional .0 or additional decimals
-      // Example: if priceNormalized is "90038", we want to match "90038.0" or "90038" in the JSON
-      const pattern = new RegExp(
-        `"price":(${escapedPrice}(?:\\.0+)?(?:\\d*)?),\\s*"qty":(${escapedQty}(?:\\.0+)?(?:\\d*)?)`,
-      );
-      const match = rawJson.match(pattern);
+    while ((match = pattern.exec(rawJson)) !== null) {
+      const rawPrice = match[1];
+      const rawQty = match[2];
 
-      if (match) {
-        return {
-          price: match[1],
-          qty: match[2],
-        };
+      // Normalize to match what json-bigint with storeAsString produces
+      const normalizedPrice = this.normalizeNumberString(rawPrice);
+      const normalizedQty = this.normalizeNumberString(rawQty);
+
+      // Key by normalized values (what json-bigint gives us after parsing)
+      const key = `${normalizedPrice}|${normalizedQty}`;
+
+      // Store each unique normalized pair. If the same normalized pair appears
+      // multiple times (extremely unlikely in a single orderbook message) the
+      // first occurrence wins — they'd have the same trailing-zero pattern anyway.
+      if (!result.has(key)) {
+        result.set(key, { price: rawPrice, qty: rawQty });
       }
-
-      return null;
-    } catch {
-      return null;
     }
+
+    return result;
+  }
+
+  /**
+   * Normalize a number string to a canonical decimal form:
+   * - "90038.0"       → "90038"
+   * - "0.00000000"    → "0"
+   * - "1.67751120"    → "1.6775112"
+   * - "12345"         → "12345" (no-op)
+   * - "7.9e-7"        → "0.00000079"  (expand scientific notation)
+   */
+  private normalizeNumberString(s: string): string {
+    // Handle scientific notation by expanding to full decimal form.
+    // json-bigint may return small numbers like 0.00000079 as "7.9e-7";
+    // the raw JSON always uses decimal notation, so we must expand to match.
+    if (s.includes('e') || s.includes('E')) {
+      try {
+        s = new Decimal(s).toFixed();
+      } catch {
+        // If Decimal.js can't parse it, fall through with original string
+      }
+    }
+    if (!s.includes('.')) return s;
+    // Strip trailing zeros after decimal, then strip trailing dot if it remains
+    const stripped = s.replace(/0+$/, '').replace(/\.$/, '');
+    return stripped || '0';
   }
 
   /**
@@ -1198,13 +1244,18 @@ export class KrakenWebSocketService
     const top10Asks = sortedAsks.slice(0, 10);
     const top10Bids = sortedBids.slice(0, 10);
 
+    // Pre-extract ALL exact numbers from rawJson once (not per-entry)
+    const exactNumbersMap = rawJson
+      ? this.extractAllExactNumbers(rawJson)
+      : undefined;
+
     // Build checksum string: asks first, then bids
     let checksumString = '';
     const askStrings: string[] = [];
     for (const ask of top10Asks) {
       const formatted = this.formatPriceLevelForChecksum(
         ask as OrderBookEntry | { price: unknown; qty: unknown },
-        rawJson,
+        exactNumbersMap,
       );
       askStrings.push(formatted);
       checksumString += formatted;
@@ -1213,7 +1264,7 @@ export class KrakenWebSocketService
     for (const bid of top10Bids) {
       const formatted = this.formatPriceLevelForChecksum(
         bid as OrderBookEntry | { price: unknown; qty: unknown },
-        rawJson,
+        exactNumbersMap,
       );
       bidStrings.push(formatted);
       checksumString += formatted;
@@ -1648,7 +1699,15 @@ export class KrakenWebSocketService
 
   private handleSubscriptionStatus(message: KrakenSubscriptionStatus): void {
     const status = message.success ? 'SUCCESS' : 'FAILED';
-    const symbol = message.result?.symbol || 'unknown';
+
+    // Handle different channel types
+    let symbol = 'unknown';
+    if (message.result?.channel === 'book' && 'symbol' in message.result) {
+      symbol = message.result.symbol;
+    } else if (message.result?.channel === 'instrument') {
+      symbol = 'instrument';
+    }
+
     this.logger.log(
       `Subscription status: ${message.method} ${symbol} - ${status}`,
     );
@@ -1656,30 +1715,32 @@ export class KrakenWebSocketService
     if (
       message.success &&
       message.method === 'subscribe' &&
-      symbol !== 'unknown'
+      message.result?.channel === 'book' &&
+      'symbol' in message.result
     ) {
-      const normalizedSymbol = symbol.toUpperCase();
+      const normalizedSymbol = message.result.symbol.toUpperCase();
       this.subscribedSymbols.add(normalizedSymbol);
 
       // Update market data subscription status
       if (this.inMemoryStore[normalizedSymbol]) {
         this.inMemoryStore[normalizedSymbol].subscriptionStatus = 'subscribed';
         this.logger.log(
-          `Market ${symbol} successfully subscribed and ready for data`,
+          `Market ${message.result.symbol} successfully subscribed and ready for data`,
         );
       }
     } else if (
       message.success &&
       message.method === 'unsubscribe' &&
-      symbol !== 'unknown'
+      message.result?.channel === 'book' &&
+      'symbol' in message.result
     ) {
-      const normalizedSymbol = symbol.toUpperCase();
+      const normalizedSymbol = message.result.symbol.toUpperCase();
 
       // Only clean up if we're not actively subscribed
       // This prevents race condition where user re-subscribes before unsubscribe confirmation arrives
       if (this.subscribedSymbols.has(normalizedSymbol)) {
         this.logger.debug(
-          `Received unsubscribe confirmation for ${symbol}, but already re-subscribed. Ignoring cleanup.`,
+          `Received unsubscribe confirmation for ${message.result.symbol}, but already re-subscribed. Ignoring cleanup.`,
         );
         return;
       }
@@ -1689,7 +1750,7 @@ export class KrakenWebSocketService
       // Clean up market data completely to prevent re-subscription
       if (this.inMemoryStore[normalizedSymbol]) {
         this.logger.log(
-          `Successfully unsubscribed from ${symbol}, cleaning up data`,
+          `Successfully unsubscribed from ${message.result.symbol}, cleaning up data`,
         );
         delete this.inMemoryStore[normalizedSymbol];
 
@@ -1755,6 +1816,13 @@ export class KrakenWebSocketService
       return [];
     }
 
+    // Pre-extract ALL exact numbers from rawJson once (not per-entry)
+    // This avoids the previous per-entry regex that could match the wrong entry
+    // when one price was a numeric prefix of another (e.g. "9003" matching "90038.0")
+    const exactNumbersMap = rawJson
+      ? this.extractAllExactNumbers(rawJson)
+      : null;
+
     // Handle both array format [price, qty] and object format {price, qty}
     return entries.map((entry) => {
       if (Array.isArray(entry)) {
@@ -1774,22 +1842,22 @@ export class KrakenWebSocketService
         let priceStr = String(entryObj.price);
         let qtyStr = String(entryObj.qty);
 
-        // CRITICAL: Extract exact representation from raw JSON to preserve trailing zeros
+        // CRITICAL: Look up exact representation from pre-built map to preserve trailing zeros
         // json-bigint strips trailing zeros ("0.00000000" → "0"), but Kraken's checksum
-        // requires the exact string representation including trailing zeros
-        if (rawJson) {
-          const extracted = this.extractExactNumbers(
-            entryObj.price,
-            entryObj.qty,
-            rawJson,
-          );
-          if (extracted) {
-            priceStr = extracted.price;
-            qtyStr = extracted.qty;
+        // requires the exact string representation including trailing zeros.
+        // We must normalize the lookup key the same way we normalized the map key,
+        // because json-bigint may return scientific notation (e.g. "7.9e-7") while
+        // the raw JSON uses decimal notation ("0.00000079").
+        if (exactNumbersMap) {
+          const key = `${this.normalizeNumberString(priceStr)}|${this.normalizeNumberString(qtyStr)}`;
+          const exact = exactNumbersMap.get(key);
+          if (exact) {
+            priceStr = exact.price;
+            qtyStr = exact.qty;
           } else {
-            // Log when extraction fails - this might indicate a problem
+            // Log when lookup fails - this might indicate a problem
             this.logger.warn(
-              `Failed to extract exact numbers for price=${entryObj.price}, qty=${entryObj.qty}. ` +
+              `Failed to find exact numbers for price=${entryObj.price}, qty=${entryObj.qty} in raw JSON map. ` +
                 `Using json-bigint values which may lack trailing zeros.`,
             );
           }
@@ -2134,5 +2202,152 @@ export class KrakenWebSocketService
   clearInvalidSymbols(): void {
     this.invalidSymbols.clear();
     this.logger.log('Cleared invalid symbols blacklist');
+  }
+
+  // ─── Instrument Channel ────────────────────────────────────────────────
+
+  /**
+   * Subscribe to the Kraken instrument channel.
+   * This provides a snapshot of all tradeable pairs with their precisions,
+   * replacing the need for the REST API /AssetPairs call.
+   */
+  private subscribeToInstrumentChannel(): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.logger.warn(
+        'Cannot subscribe to instrument channel - WebSocket not connected',
+      );
+      return;
+    }
+
+    const reqId = this.reqIdCounter++;
+    const msg: KrakenSubscriptionMessage = {
+      method: 'subscribe',
+      params: {
+        channel: 'instrument',
+        snapshot: true,
+      },
+      req_id: reqId,
+    };
+
+    this.logger.log(
+      'Subscribing to instrument channel for pair reference data',
+    );
+    this.ws.send(JSON.stringify(msg));
+  }
+
+  /**
+   * Handle instrument channel snapshot and update messages.
+   * Builds and maintains the available markets + precision cache.
+   */
+  private handleInstrumentMessage(
+    type: string,
+    pairs: KrakenInstrumentPair[],
+  ): void {
+    if (pairs.length === 0) {
+      if (type === 'snapshot') {
+        this.logger.warn(
+          'Instrument snapshot received with no pairs — skipping',
+        );
+      }
+      return;
+    }
+
+    if (type === 'snapshot') {
+      // Full replacement
+      this.instrumentPairs = pairs;
+      this.logger.log(`Instrument snapshot received: ${pairs.length} pairs`);
+    } else {
+      // Incremental update — merge by symbol
+      for (const updatedPair of pairs) {
+        if (!updatedPair.symbol) continue;
+        const idx = this.instrumentPairs.findIndex(
+          (p) => p.symbol === updatedPair.symbol,
+        );
+        if (idx !== -1) {
+          const merged: KrakenInstrumentPair = {
+            ...this.instrumentPairs[idx],
+            ...updatedPair,
+          };
+          this.instrumentPairs[idx] = merged;
+        } else {
+          this.instrumentPairs.push(updatedPair);
+        }
+      }
+      this.logger.debug(
+        `Instrument update received: ${pairs.length} pairs updated`,
+      );
+    }
+
+    this.rebuildInstrumentCache();
+  }
+
+  /**
+   * Rebuild the derived caches (available markets list + precision map)
+   * from the raw instrument pairs array.
+   */
+  private rebuildInstrumentCache(): void {
+    const markets: string[] = [];
+    const precisions: Record<string, { price: number; volume: number }> = {};
+
+    for (const pair of this.instrumentPairs) {
+      // Only include online / tradeable pairs
+      if (pair.status && pair.status !== 'online') continue;
+      if (!pair.symbol) continue;
+
+      const symbol = pair.symbol; // Already in "BASE/QUOTE" format from Kraken WS v2
+      markets.push(symbol);
+
+      const normalizedSymbol = symbol.toUpperCase();
+      precisions[normalizedSymbol] = {
+        price: pair.price_precision ?? 8,
+        volume: pair.qty_precision ?? 8,
+      };
+    }
+
+    // Add commonly used aliases (Kraken uses XBT internally for BTC)
+    const commonAliases: [string, string][] = [
+      ['BTC/USD', 'XBT/USD'],
+      ['BTC/EUR', 'XBT/EUR'],
+    ];
+    for (const [alias, xbtEquivalent] of commonAliases) {
+      if (!markets.includes(alias) && markets.includes(xbtEquivalent)) {
+        markets.push(alias);
+        precisions[alias.toUpperCase()] = precisions[
+          xbtEquivalent.toUpperCase()
+        ] ?? { price: 8, volume: 8 };
+      }
+    }
+
+    this.cachedAvailableMarkets = markets.sort();
+    this.cachedMarketPrecisions = precisions;
+    this.instrumentDataReady = true;
+
+    this.emit('instrumentDataReady');
+    this.logger.log(
+      `Instrument cache rebuilt: ${this.cachedAvailableMarkets.length} available markets`,
+    );
+  }
+
+  /**
+   * Get sorted list of all available / tradeable market symbols.
+   * Populated from the instrument WS channel.
+   */
+  getAvailableMarkets(): string[] {
+    return this.cachedAvailableMarkets;
+  }
+
+  /**
+   * Get precision data for all markets (price + volume decimals).
+   * Populated from the instrument WS channel.
+   */
+  getMarketPrecisions(): Record<string, { price: number; volume: number }> {
+    return this.cachedMarketPrecisions;
+  }
+
+  /**
+   * Whether the instrument snapshot has been received and the cache is ready.
+   */
+  isInstrumentDataReady(): boolean {
+    return this.instrumentDataReady;
   }
 }

@@ -1,55 +1,6 @@
 import { Decimal } from 'decimal.js';
 
-export interface KrakenBookSnapshot {
-  channel: 'book';
-  type: 'snapshot';
-  data: [
-    {
-      symbol: string;
-      bids: [string, string][]; // [price, qty]
-      asks: [string, string][]; // [price, qty]
-      checksum: number;
-    },
-  ];
-}
-
-export interface KrakenBookUpdate {
-  channel: 'book';
-  type: 'update';
-  data: [
-    {
-      symbol: string;
-      bids?: [string, string][]; // [price, qty]
-      asks?: [string, string][]; // [price, qty]
-      checksum: number;
-    },
-  ];
-}
-
-export interface KrakenSubscriptionMessage {
-  method: 'subscribe' | 'unsubscribe';
-  params: {
-    channel: 'book';
-    symbol: string[];
-    depth?: number;
-  };
-  req_id?: number;
-}
-
-export interface KrakenSubscriptionStatus {
-  method: 'subscribe' | 'unsubscribe';
-  result: {
-    channel: 'book';
-    depth: number;
-    snapshot: boolean;
-    symbol: string;
-  };
-  success: boolean;
-  time_in: string;
-  time_out: string;
-  req_id?: number;
-}
-
+// Orderbook entry with precise arithmetic support
 export interface OrderBookEntry {
   price: Decimal; // Use Decimal for precise arithmetic
   quantity: Decimal; // Use Decimal for precise arithmetic
@@ -57,6 +8,7 @@ export interface OrderBookEntry {
   originalQty: string; // Original string from JSON to preserve exact representation for checksums
 }
 
+// Complete orderbook state
 export interface OrderBook {
   symbol: string;
   bids: OrderBookEntry[];
@@ -65,6 +17,7 @@ export interface OrderBook {
   lastUpdate: Date;
 }
 
+// Market data structure for client consumption
 export interface MarketData {
   orderbooksPerMinute: number;
   orderbook: {
@@ -85,11 +38,7 @@ export interface MarketData {
   lastError?: string;
 }
 
+// In-memory store type
 export interface InMemoryStore {
   [symbol: string]: MarketData;
 }
-
-export type KrakenMessage =
-  | KrakenBookSnapshot
-  | KrakenBookUpdate
-  | KrakenSubscriptionStatus;

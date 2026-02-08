@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { KrakenWebSocketService } from './kraken-websocket.service';
-import { MarketData } from '../types/kraken.types';
+import { MarketData } from '../types/types';
 
 // This service keeps track of subscribed clients (vue apps) and their market subscriptions
 // It manages subscribing/unsubscribing to Kraken markets based on active clients

@@ -1,73 +1,74 @@
 # Order Book Spread Tracker
 
 This application displays real-time order book information for multiple Kraken markets.
-It allows users to monitor basic market health metrics such as spread and update speed.
+It allows users to monitor basic market health metrics such as spread and orderbook update speed. Useful for scanning identifying markets with wide spreads where High-Frequency trading bots could be deployed.
 
 ## Overview
 
 The system consists of:
-• Backend (NestJS)
-Connects to the Kraken WebSocket API, maintains local order book state, computes derived metrics, and streams updates to clients.
-• Frontend (Vue 3)
-Displays real-time data and allows users to select which markets to track.
+
+- Backend (NestJS)
+  Connects to the Kraken WebSocket API, maintains local order book state, computes derived metrics, and streams updates to clients.
+- Frontend (Vue 3)
+  Displays real-time data and allows users to select which markets to track.
 
 A backend layer is used to centralize exchange connectivity and to control the rate at which updates are sent to the UI.
 
 ## Running the application locally
 
-Prerequisites
-• Node.js (LTS)
-• pnpm
+Prerequisites:
 
-Steps 1. Install dependencies
-`pnpm install `
+- Node.js 18+
+- pnpm
 
-2. Start the application
-   `pnpm dev `
+Steps:
 
-3. Open in browser
-   `http://localhost:3000`
+1. Install dependencies: `pnpm i`
+2. Start the application: `pnpm dev`
+3. Open in browser: `http://localhost:3000`
 
-If the frontend starts before the backend WebSocket server is ready, a browser refresh may be required.
+NOTE: If the frontend starts before the backend is up and running, you might need to refresh the page.
 
 ## How it works
 
-## Frontend
+### Frontend
 
-    •	The frontend opens a single WebSocket connection to the backend.
-    •	Users can dynamically add or remove markets to track.
-    •	Each market widget displays:
-    •	Top 3 bids and asks
-    •	Mid-price
-    •	Spread (percentage)
-    •	Order book update speed (ob updates over last 60 seconds)
-    •	Supported markets and rounding precision are fetched from a backend REST endpoint.
-    •	Time since last orderbook update.
+- The frontend opens a single WebSocket connection to the backend.
+- Users can dynamically add or remove markets to track.
 
-## Backend
+Each market widget displays:
 
-    •	The backend keeps an in-memory registry of markets requested by at least one connected client.
-    •	A market is subscribed to on Kraken only if it has active frontend subscribers.
-    •	When no clients remain, the market is unsubscribed.
-    •	If local cache gets out of sync we re-sync immediately so the front-end always gets correct data.
+- Top 3 bids and asks
+- Mid-price
+- Spread (percentage)
+- Order book update speed (ob updates over last 60 seconds)
+- Supported markets and rounding precision are fetched from a backend REST endpoint.
+- Time since last orderbook update.
 
-## Order book processing
+### Backend
 
-    •	For each market:
-    •	An initial snapshot is received from Kraken.
-    •	Incremental updates are applied sequentially to the local snapshot.
-    •	A checksum is computed and validated to detect inconsistencies.
-    •	If invalid state is detected (e.g. negative spread, checksum mismatch), the local order book is discarded and resynchronized.
-    •	Incoming Kraken messages are queued per market and processed sequentially.
-    •	Updates sent to frontend clients are throttled to limit re-rendering frequency.
+- The backend keeps an in-memory registry of markets requested by at least one connected client.
+- A market is subscribed to on Kraken only if it has active frontend subscribers.
+- When no clients remain, the market is unsubscribed.
+- If local cache gets out of sync we re-sync immediately so the front-end always gets correct data.
 
-## Order book speed
+### Order book processing
 
-    •	Update speed is computed as a rolling count of order book updates over the last 60 seconds.
-    •	This metric is used to detect inactive or stalled markets.
+For each market:
 
-## Potential improvements
+- An initial snapshot is received from Kraken.
+- Incremental updates are applied sequentially to the local snapshot.
+- A checksum is computed and validated to detect inconsistencies.
+- If invalid state is detected (e.g. negative spread, checksum mismatch), the local order book is discarded and resynchronized.
+- Incoming Kraken messages are queued per market and processed sequentially.
+- Updates sent to frontend clients are throttled to limit re-rendering frequency.
 
-    •	Checksum is failing sometimes, which needs to be investigated further, we currently handle it with market resync. Happens once per 500 updates or so.
-    •	Would be nicer to have internal unified data structure and adaptors for different exchanges. This would be a clean way to support multiple exchanges.
-    •	WS connection redundancy - sometimes WS connections break and we auto-reconnect but since this happens randomly we could already have a backup connection and feed data fom both to minimize chances of live feed downtime.
+### Order book speed
+
+- Update speed is computed as a rolling count of order book updates over the last 60 seconds.
+- This metric is used to detect inactive or stalled markets.
+
+### Potential improvements
+
+- In order to support multiple exchanges in the future, would be better to have exchange-agnostic internal data structure and adapters for each supported exchange, kind of like CCXT or just go with CCXT-PRO which has WS support.
+- WS connection redundancy - sometimes exchange would disconnect the WS connection. We are reconnecting automatically but to avoid having delays and gaps in the data caused by the reconnection we could have parallel ws connections, one of which will be always acting as a backup while we reconnect the broken one. This would lead to less downtime. But would be an overkill for this tool.

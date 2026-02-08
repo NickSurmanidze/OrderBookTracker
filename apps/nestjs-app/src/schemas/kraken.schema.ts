@@ -21,15 +21,37 @@ const ErrorMessageSchema = z.object({
   req_id: z.number().optional(),
 });
 
-// Subscription status message
+// Subscription message (outgoing)
+const SubscriptionMessageSchema = z.object({
+  method: z.enum(['subscribe', 'unsubscribe']),
+  params: z.object({
+    channel: z.enum(['book', 'instrument']),
+    symbol: z.array(z.string()).optional(),
+    depth: z.number().optional(),
+    snapshot: z.boolean().optional(),
+  }),
+  req_id: z.number().optional(),
+});
+
+// Subscription status message (incoming response)
 const SubscriptionStatusSchema = z.object({
   method: z.enum(['subscribe', 'unsubscribe']),
+  result: z.discriminatedUnion('channel', [
+    z.object({
+      channel: z.literal('book'),
+      depth: z.number(),
+      snapshot: z.boolean(),
+      symbol: z.string(),
+    }),
+    z.object({
+      channel: z.literal('instrument'),
+      snapshot: z.boolean(),
+      warnings: z.array(z.string()).optional(),
+    }),
+  ]),
   success: z.boolean(),
-  result: z
-    .object({
-      symbol: z.string().optional(),
-    })
-    .optional(),
+  time_in: z.string(),
+  time_out: z.string(),
   req_id: z.number().optional(),
 });
 
@@ -61,36 +83,98 @@ const StatusUpdateSchema = z.object({
   ),
 });
 
+// Instrument pair schema
+const InstrumentPairSchema = z.object({
+  base: z.string().optional(),
+  quote: z.string().optional(),
+  symbol: z.string().optional(),
+  status: z.string().optional(),
+  price_precision: z.number().optional(),
+  qty_precision: z.number().optional(),
+  price_increment: z.number().optional(),
+  qty_increment: z.number().optional(),
+  qty_min: z.number().optional(),
+  marginable: z.boolean().optional(),
+  has_index: z.boolean().optional(),
+  cost_min: z.union([z.string(), z.number()]).optional(),
+  cost_precision: z.number().optional(),
+  margin_initial: z.number().optional(),
+  position_limit_long: z.number().optional(),
+  position_limit_short: z.number().optional(),
+});
+
+// Instrument asset schema
+const InstrumentAssetSchema = z.object({
+  id: z.string().optional(),
+  status: z.string().optional(),
+  precision: z.number().optional(),
+  precision_display: z.number().optional(),
+  borrowable: z.boolean().optional(),
+  collateral_value: z.number().optional(),
+  margin_rate: z.number().optional(),
+  multiplier: z.number().optional(),
+});
+
+// Instrument data schema
+const InstrumentDataSchema = z.object({
+  assets: z.array(InstrumentAssetSchema),
+  pairs: z.array(InstrumentPairSchema),
+});
+
+// Instrument snapshot/update message
+const InstrumentMessageSchema = z.object({
+  channel: z.literal('instrument'),
+  type: z.enum(['snapshot', 'update']),
+  data: InstrumentDataSchema,
+});
+
 // Heartbeat message
 const HeartbeatSchema = z.object({
   channel: z.literal('heartbeat'),
 });
 
-// Discriminated union of all possible messages
-export const KrakenMessageSchema = z.discriminatedUnion('type', [
-  ErrorMessageSchema.extend({ type: z.literal('error') }),
-  SubscriptionStatusSchema.extend({ type: z.literal('subscription') }),
-  BookSnapshotSchema,
-  BookUpdateSchema,
-  StatusUpdateSchema,
-]);
-
-// However, the actual messages don't have a top-level 'type' field in the same way
-// So let's use a different approach with z.union
+// Main validation schema for all incoming WebSocket messages
 export const KrakenWebSocketMessageSchema = z.union([
   ErrorMessageSchema,
   SubscriptionStatusSchema,
   BookSnapshotSchema,
   BookUpdateSchema,
   StatusUpdateSchema,
+  InstrumentMessageSchema,
   HeartbeatSchema,
 ]);
 
-// Type inference
+// Export individual schemas for specific validations
+export {
+  SubscriptionMessageSchema,
+  BookSnapshotSchema,
+  BookUpdateSchema,
+  InstrumentMessageSchema,
+  InstrumentPairSchema,
+  InstrumentAssetSchema,
+  InstrumentDataSchema,
+  SubscriptionStatusSchema,
+  ErrorMessageSchema,
+};
+
+// Zod-inferred types - these replace manually declared interfaces
 export type KrakenWebSocketMessage = z.infer<
   typeof KrakenWebSocketMessageSchema
 >;
-export type BookSnapshot = z.infer<typeof BookSnapshotSchema>;
-export type BookUpdate = z.infer<typeof BookUpdateSchema>;
-export type SubscriptionStatus = z.infer<typeof SubscriptionStatusSchema>;
-export type ErrorMessage = z.infer<typeof ErrorMessageSchema>;
+export type KrakenSubscriptionMessage = z.infer<
+  typeof SubscriptionMessageSchema
+>;
+export type KrakenBookSnapshot = z.infer<typeof BookSnapshotSchema>;
+export type KrakenBookUpdate = z.infer<typeof BookUpdateSchema>;
+export type KrakenInstrumentMessage = z.infer<typeof InstrumentMessageSchema>;
+export type KrakenInstrumentPair = z.infer<typeof InstrumentPairSchema>;
+export type KrakenInstrumentAsset = z.infer<typeof InstrumentAssetSchema>;
+export type KrakenInstrumentData = z.infer<typeof InstrumentDataSchema>;
+export type KrakenSubscriptionStatus = z.infer<typeof SubscriptionStatusSchema>;
+export type KrakenErrorMessage = z.infer<typeof ErrorMessageSchema>;
+
+// Union type for message handling
+export type KrakenMessage =
+  | KrakenBookSnapshot
+  | KrakenBookUpdate
+  | KrakenSubscriptionStatus;
