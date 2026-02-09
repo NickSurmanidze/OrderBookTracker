@@ -40,12 +40,12 @@ const SubscriptionStatusSchema = z.object({
     z.object({
       channel: z.literal('book'),
       depth: z.number(),
-      snapshot: z.boolean(),
+      snapshot: z.boolean().optional(),
       symbol: z.string(),
     }),
     z.object({
       channel: z.literal('instrument'),
-      snapshot: z.boolean(),
+      snapshot: z.boolean().optional(),
       warnings: z.array(z.string()).optional(),
     }),
   ]),
