@@ -260,7 +260,7 @@ export class MarketDataGateway
       } else {
         // Only log once when data first becomes unavailable
         if (!this.noDataLoggedMarkets.has(market)) {
-          this.logger.debug(`No market data available for ${market} yet`);
+          this.logger.debug(`Init market data for ${market}`);
           this.noDataLoggedMarkets.add(market);
         }
       }

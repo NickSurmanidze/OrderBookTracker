@@ -11,7 +11,6 @@ import JSONbig from 'json-bigint';
 import { Decimal } from 'decimal.js';
 import { MetricsService } from './metrics.service';
 import {
-  KrakenMessage,
   KrakenBookSnapshot,
   KrakenBookUpdate,
   KrakenSubscriptionMessage,
@@ -86,9 +85,7 @@ export class KrakenWebSocketService
   private symbolQueues = new Map<string, QueuedMessage[]>();
   private processingQueues = new Set<string>();
   private resyncingSymbols = new Set<string>(); // Track symbols currently resyncing
-  private validationTimers = new Map<string, NodeJS.Timeout>(); // Debounced validation timers
   private readonly MAX_QUEUE_SIZE = 1000; // Prevent memory issues
-  private readonly VALIDATION_DELAY_MS = 100; // Wait 100ms before validating to allow batched updates
 
   constructor(private readonly metricsService: MetricsService) {
     super();
@@ -222,7 +219,7 @@ export class KrakenWebSocketService
             return;
           }
 
-          const message = parseResult.data as KrakenMessage;
+          const message = parseResult.data;
           this.handleKrakenMessage(message, rawJson);
         } catch (error) {
           this.logger.error(
@@ -639,31 +636,10 @@ export class KrakenWebSocketService
         }
       }
 
-      // Schedule debounced validation after all updates are processed
-      this.scheduleValidation(normalizedSymbol);
+      this.validateOrderbookIntegrity(normalizedSymbol);
     } finally {
       this.processingQueues.delete(normalizedSymbol);
     }
-  }
-
-  /**
-   * Schedule a debounced validation - waits for updates to settle before checking,
-   * if there is a burst of updates and all of them should be applied before checking for integrity (negative or zero spread)
-   */
-  private scheduleValidation(normalizedSymbol: string): void {
-    // Clear any existing validation timer
-    const existingTimer = this.validationTimers.get(normalizedSymbol);
-    if (existingTimer) {
-      clearTimeout(existingTimer);
-    }
-
-    // Schedule validation after delay to allow batched updates to complete
-    const timer = setTimeout(() => {
-      this.validateOrderbookIntegrity(normalizedSymbol);
-      this.validationTimers.delete(normalizedSymbol);
-    }, this.VALIDATION_DELAY_MS);
-
-    this.validationTimers.set(normalizedSymbol, timer);
   }
 
   private handleKrakenMessage(message: any, rawJson?: string): void {
@@ -886,12 +862,10 @@ export class KrakenWebSocketService
     // Verify checksum if provided - use raw data from Kraken
     if ('checksum' in data && typeof data.checksum === 'number') {
       if (data.asks && data.bids) {
-        this.verifyChecksum(
+        this.verifyChecksumWithSnapshot(
           normalizedSymbol,
           data.checksum,
-          data.asks,
-          data.bids,
-          queuedMessage.rawJson,
+          this.inMemoryStore[symbol.toUpperCase()].orderbook,
         );
       }
     }
@@ -1056,8 +1030,8 @@ export class KrakenWebSocketService
    * - Remove decimal point from price and quantity (KEEP trailing zeros as-is)
    * - Strip leading zeros from BOTH price AND quantity
    * - Concatenate price and quantity
+   * https://docs.kraken.com/api/docs/guides/spot-ws-book-v2/
    * Accepts either raw Kraken data or OrderBookEntry
-   * @param rawJson - Optional raw JSON string to extract exact numeric representation
    */
   private formatPriceLevelForChecksum(
     entry:
@@ -1208,220 +1182,6 @@ export class KrakenWebSocketService
     // Strip trailing zeros after decimal, then strip trailing dot if it remains
     const stripped = s.replace(/0+$/, '').replace(/\.$/, '');
     return stripped || '0';
-  }
-
-  /**
-   * Helper function to safely extract price from orderbook entry
-   * Handles both object format {price, qty} and array format [price, qty]
-   */
-  private getPriceFromEntry(entry: unknown): number {
-    const typedEntry = entry as { price?: unknown; [key: number]: unknown };
-    const priceValue = typedEntry.price ?? typedEntry[0];
-    return parseFloat(String(priceValue));
-  }
-
-  /**
-   * Calculate CRC32 checksum using raw Kraken data (preserves precision)
-   * Uses top 10 asks (ascending) and top 10 bids (descending)
-   * @param rawJson - The raw JSON string to extract exact numeric representations
-   */
-  private calculateChecksumFromRaw(
-    rawAsks: unknown[],
-    rawBids: unknown[],
-    rawJson?: string,
-  ): number {
-    // CRITICAL: Sort asks ascending (lowest first) and bids descending (highest first)
-    // Kraken's checksum is calculated on sorted data
-    const sortedAsks = [...rawAsks].sort((a, b) => {
-      return this.getPriceFromEntry(a) - this.getPriceFromEntry(b); // Ascending
-    });
-
-    const sortedBids = [...rawBids].sort((a, b) => {
-      return this.getPriceFromEntry(b) - this.getPriceFromEntry(a); // Descending
-    });
-
-    // Take top 10 of each
-    const top10Asks = sortedAsks.slice(0, 10);
-    const top10Bids = sortedBids.slice(0, 10);
-
-    // Pre-extract ALL exact numbers from rawJson once (not per-entry)
-    const exactNumbersMap = rawJson
-      ? this.extractAllExactNumbers(rawJson)
-      : undefined;
-
-    // Build checksum string: asks first, then bids
-    let checksumString = '';
-    const askStrings: string[] = [];
-    for (const ask of top10Asks) {
-      const formatted = this.formatPriceLevelForChecksum(
-        ask as OrderBookEntry | { price: unknown; qty: unknown },
-        exactNumbersMap,
-      );
-      askStrings.push(formatted);
-      checksumString += formatted;
-    }
-    const bidStrings: string[] = [];
-    for (const bid of top10Bids) {
-      const formatted = this.formatPriceLevelForChecksum(
-        bid as OrderBookEntry | { price: unknown; qty: unknown },
-        exactNumbersMap,
-      );
-      bidStrings.push(formatted);
-      checksumString += formatted;
-    }
-
-    // this.logger.debug(
-    //   `Checksum calculation from raw:\n` +
-    //     `  Full string: "${checksumString}"\n` +
-    //     `  Length: ${checksumString.length}\n` +
-    //     `  Ask strings: ${JSON.stringify(askStrings)}\n` +
-    //     `  Bid strings: ${JSON.stringify(bidStrings)}`,
-    // );
-
-    // Calculate CRC32 using buffer-crc32
-    // Pass string, it returns a Buffer. Read as unsigned 32-bit BE integer
-    const crcBuffer = crc32(checksumString);
-    return crcBuffer.readUInt32BE(0);
-  }
-
-  /**
-   * Calculate CRC32 checksum using current orderbook state (for updates)
-   * Uses top 10 asks (ascending) and top 10 bids (descending)
-   */
-  private calculateChecksumFromCurrentState(normalizedSymbol: string): number {
-    const marketData = this.inMemoryStore[normalizedSymbol];
-    if (!marketData) return 0;
-
-    const { asks, bids } = marketData.orderbook;
-
-    // Get top 10 asks sorted ascending (lowest to highest)
-    const top10Asks = [...asks]
-      .sort((a, b) => a.price.comparedTo(b.price))
-      .slice(0, 10);
-
-    // Get top 10 bids sorted descending (highest to lowest)
-    const top10Bids = [...bids]
-      .sort((a, b) => b.price.comparedTo(a.price))
-      .slice(0, 10);
-
-    // Check if we have originalPrice/originalQty preserved
-    const asksWithOriginal = top10Asks.filter((a) => a.originalPrice).length;
-    const bidsWithOriginal = top10Bids.filter((b) => b.originalPrice).length;
-    const hasOriginalStrings = asksWithOriginal > 0 || bidsWithOriginal > 0;
-
-    if (!hasOriginalStrings) {
-      this.logger.warn(
-        `Checksum calculation for ${normalizedSymbol}: No originalPrice/originalQty found in orderbook entries. ` +
-          `This will cause checksum mismatch. Asks: ${asksWithOriginal}/${top10Asks.length}, Bids: ${bidsWithOriginal}/${top10Bids.length}`,
-      );
-    } else if (
-      asksWithOriginal < top10Asks.length ||
-      bidsWithOriginal < top10Bids.length
-    ) {
-      this.logger.warn(
-        `Checksum calculation for ${normalizedSymbol}: Partial original strings preserved. ` +
-          `Asks: ${asksWithOriginal}/${top10Asks.length}, Bids: ${bidsWithOriginal}/${top10Bids.length}. May cause mismatch.`,
-      );
-    }
-
-    // Build checksum string: asks first, then bids
-    let checksumString = '';
-    const askStrings: string[] = [];
-    const askDetails: string[] = [];
-    for (const ask of top10Asks) {
-      const formatted = this.formatPriceLevelForChecksum(ask);
-      askStrings.push(formatted);
-      checksumString += formatted;
-      askDetails.push(
-        `${ask.price.toString()}/${ask.quantity.toString()} (orig: ${ask.originalPrice || 'none'}/${ask.originalQty || 'none'})`,
-      );
-    }
-    const bidStrings: string[] = [];
-    const bidDetails: string[] = [];
-    for (const bid of top10Bids) {
-      const formatted = this.formatPriceLevelForChecksum(bid);
-      bidStrings.push(formatted);
-      checksumString += formatted;
-      bidDetails.push(
-        `${bid.price.toString()}/${bid.quantity.toString()} (orig: ${bid.originalPrice || 'none'}/${bid.originalQty || 'none'})`,
-      );
-    }
-
-    // Log detailed checksum calculation when original strings are missing
-    if (
-      !hasOriginalStrings ||
-      asksWithOriginal < top10Asks.length ||
-      bidsWithOriginal < top10Bids.length
-    ) {
-      this.logger.debug(
-        `Checksum details for ${normalizedSymbol}:\n` +
-          `  Top 10 Asks: ${askDetails.join(', ')}\n` +
-          `  Top 10 Bids: ${bidDetails.join(', ')}\n` +
-          `  Formatted asks: ${askStrings.join(', ')}\n` +
-          `  Formatted bids: ${bidStrings.join(', ')}\n` +
-          `  Checksum string: "${checksumString}" (length: ${checksumString.length})`,
-      );
-    }
-
-    // this.logger.debug(
-    //   `Checksum calculation from local state:\n` +
-    //     `  Full string: "${checksumString}"\n` +
-    //     `  Length: ${checksumString.length}\n` +
-    //     `  Ask strings: ${JSON.stringify(askStrings)}\n` +
-    //     `  Bid strings: ${JSON.stringify(bidStrings)}\n` +
-    //     `  First ask original: price=${top10Asks[0]?.originalPrice}, qty=${top10Asks[0]?.originalQty}\n` +
-    //     `  First bid original: price=${top10Bids[0]?.originalPrice}, qty=${top10Bids[0]?.originalQty}`,
-    // );
-
-    // Calculate CRC32 using buffer-crc32
-    const crcBuffer = crc32(checksumString);
-    return crcBuffer.readUInt32BE(0);
-  }
-
-  /**
-   * Verify checksum against Kraken's provided value using raw data (for snapshots)
-   * If mismatch detected, trigger resync
-   */
-  private verifyChecksum(
-    normalizedSymbol: string,
-    krakenChecksum: number,
-    rawAsks: any[],
-    rawBids: any[],
-    rawJson?: string,
-  ): void {
-    if (!Array.isArray(rawAsks) || !Array.isArray(rawBids)) {
-      this.logger.debug(`Skipping checksum verification - missing data`);
-      return;
-    }
-
-    // Calculate checksum from raw snapshot data
-    const calculatedChecksum = this.calculateChecksumFromRaw(
-      rawAsks,
-      rawBids,
-      rawJson,
-    );
-
-    // Debug: Also calculate from our local stored copy to compare
-    // const localChecksum =
-    //   this.calculateChecksumFromCurrentState(normalizedSymbol);
-
-    // this.logger.debug(
-    //   `Checksum comparison for ${normalizedSymbol}:\n` +
-    //     `  Kraken's checksum:      ${krakenChecksum}\n` +
-    //     `  From raw snapshot:      ${calculatedChecksum} ${calculatedChecksum === krakenChecksum ? '✅' : '❌'}\n` +
-    //     `  From local orderbook:   ${localChecksum} ${localChecksum === krakenChecksum ? '✅' : '❌'}\n` +
-    //     `  Raw asks sample: ${JSON.stringify(rawAsks.slice(0, 2))}\n` +
-    //     `  Raw bids sample: ${JSON.stringify(rawBids.slice(0, 2))}`,
-    // );
-
-    if (calculatedChecksum !== krakenChecksum) {
-      this.logger.warn(
-        `Checksum mismatch for ${normalizedSymbol}: ` +
-          `expected ${krakenChecksum}, got ${calculatedChecksum}. ` +
-          `Asks: ${rawAsks.length}, Bids: ${rawBids.length}. Resyncing...`,
-      );
-      this.resyncMarket(normalizedSymbol);
-    }
   }
 
   /**
@@ -1576,81 +1336,6 @@ export class KrakenWebSocketService
   }
 
   /**
-   * Verify checksum using current orderbook state (for updates)
-   * If mismatch detected, trigger resync
-   */
-  private verifyChecksumWithCurrentState(
-    normalizedSymbol: string,
-    krakenChecksum: number,
-  ): void {
-    const calculatedChecksum =
-      this.calculateChecksumFromCurrentState(normalizedSymbol);
-
-    if (calculatedChecksum !== krakenChecksum) {
-      const marketData = this.inMemoryStore[normalizedSymbol];
-      const askCount = marketData?.orderbook.asks.length || 0;
-      const bidCount = marketData?.orderbook.bids.length || 0;
-
-      // Log detailed information about the mismatch
-      const top10Asks = [...(marketData?.orderbook.asks || [])]
-        .sort((a, b) => a.price.comparedTo(b.price))
-        .slice(0, 10);
-      const top10Bids = [...(marketData?.orderbook.bids || [])]
-        .sort((a, b) => b.price.comparedTo(a.price))
-        .slice(0, 10);
-
-      const askDetails = top10Asks.map(
-        (a) =>
-          `${a.price.toString()}/${a.quantity.toString()} (orig: ${a.originalPrice || 'NONE'}/${a.originalQty || 'NONE'})`,
-      );
-      const bidDetails = top10Bids.map(
-        (b) =>
-          `${b.price.toString()}/${b.quantity.toString()} (orig: ${b.originalPrice || 'NONE'}/${b.originalQty || 'NONE'})`,
-      );
-
-      this.logger.warn(
-        `Checksum mismatch for ${normalizedSymbol}: ` +
-          `expected ${krakenChecksum}, got ${calculatedChecksum}. ` +
-          `Orderbook has ${askCount} asks, ${bidCount} bids. Resyncing...`,
-      );
-
-      this.logger.debug(
-        `CHECKSUM MISMATCH DETAILS for ${normalizedSymbol}:\n` +
-          `  Expected: ${krakenChecksum}\n` +
-          `  Calculated: ${calculatedChecksum}\n` +
-          `  Top 10 Asks:\n    ${askDetails.join('\n    ')}\n` +
-          `  Top 10 Bids:\n    ${bidDetails.join('\n    ')}`,
-      );
-
-      // Now calculate and log the actual checksum string
-      const checksumAskStrings: string[] = [];
-      const checksumBidStrings: string[] = [];
-      for (const ask of top10Asks) {
-        const formatted = this.formatPriceLevelForChecksum(ask);
-        checksumAskStrings.push(formatted);
-      }
-      for (const bid of top10Bids) {
-        const formatted = this.formatPriceLevelForChecksum(bid);
-        checksumBidStrings.push(formatted);
-      }
-      const fullChecksumString =
-        checksumAskStrings.join('') + checksumBidStrings.join('');
-
-      this.logger.debug(
-        `CHECKSUM STRING BREAKDOWN:\n` +
-          `  Ask formatted: [${checksumAskStrings.join(', ')}]\n` +
-          `  Bid formatted: [${checksumBidStrings.join(', ')}]\n` +
-          `  Full checksum string: "${fullChecksumString}"\n` +
-          `  String length: ${fullChecksumString.length}\n` +
-          `  Note: Asks sorted ascending (${top10Asks[0]?.price.toString()} to ${top10Asks[9]?.price.toString()}), ` +
-          `Bids sorted descending (${top10Bids[0]?.price.toString()} to ${top10Bids[9]?.price.toString()})`,
-      );
-
-      this.resyncMarket(normalizedSymbol);
-    }
-  }
-
-  /**
    * Validate orderbook integrity after processing all queued updates
    */
   private validateOrderbookIntegrity(normalizedSymbol: string): void {
@@ -1690,11 +1375,6 @@ export class KrakenWebSocketService
         this.resyncMarket(normalizedSymbol);
       }
     }
-  }
-
-  private handleBookUpdate(message: KrakenBookUpdate): void {
-    // This method is kept for compatibility but now delegates to queue system
-    this.enqueueMessage(message);
   }
 
   private handleSubscriptionStatus(message: KrakenSubscriptionStatus): void {
@@ -1758,13 +1438,6 @@ export class KrakenWebSocketService
         this.symbolQueues.delete(normalizedSymbol);
         this.processingQueues.delete(normalizedSymbol);
         this.resyncingSymbols.delete(normalizedSymbol); // Clear resync tracking
-
-        // Clear validation timer
-        const validationTimer = this.validationTimers.get(normalizedSymbol);
-        if (validationTimer) {
-          clearTimeout(validationTimer);
-          this.validationTimers.delete(normalizedSymbol);
-        }
 
         // Try to clean up metrics if they have decayed to 0
         // Don't force remove during reconnects - let them naturally decay
